@@ -1,0 +1,15 @@
+/target
+/.agents/
+/.claude/
+/.codex/
+/.split-staging/
+/monitor.toml
+/monitor.*.toml
+!/monitor.example.toml
+/*.sqlite3
+/*.sqlite3-*
+/*.db
+/.env
+/.env.*
+*.pem
+*.key

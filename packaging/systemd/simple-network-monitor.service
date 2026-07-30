@@ -1,0 +1,33 @@
+[Unit]
+Description=Simple Network Monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=simple-network-monitor
+Group=simple-network-monitor
+Environment=RUST_LOG=info
+Environment=HOME=/var/lib/simple-network-monitor
+ExecStart=/usr/local/bin/simple-network-monitor --config /etc/simple-network-monitor/monitor.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# systemd creates and owns /var/lib/simple-network-monitor for the service user.
+# Set database_path = "/var/lib/simple-network-monitor/network-monitor.sqlite3".
+StateDirectory=simple-network-monitor
+WorkingDirectory=/var/lib/simple-network-monitor
+
+# Needed only when backend = "raw"; harmless when backend = "system".
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/simple-network-monitor
+
+[Install]
+WantedBy=multi-user.target

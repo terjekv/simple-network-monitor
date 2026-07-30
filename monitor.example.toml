@@ -1,0 +1,72 @@
+# Copy to monitor.toml and adjust for your network.
+#
+# Unknown keys in any [table] or [[hosts]] block are rejected at startup
+# (deny_unknown_fields) so typos surface immediately. Group named tables
+# under [groups]; everything else goes at the top level or inside hosts.
+bind = "127.0.0.1:3000"
+database_path = "./network-monitor.sqlite3"
+# Optional. Limits Actix HTTP API worker threads. Omit to use Actix's default,
+# which is based on available CPU parallelism.
+# api_workers = 2
+# "auto" tries raw ICMP first (dual-stack: IPv4 + best-effort IPv6) and
+# falls back to invoking the system `ping` binary if raw sockets are not
+[modules.icmp]
+# available. "system" forces the binary path, "raw" requires raw sockets.
+backend = "system"
+interval = "30s"
+timeout = "1s"
+# Maximum simultaneous ICMP checks. This is not the HTTP worker count.
+concurrency = 128
+failure_threshold = 2
+success_threshold = 1
+
+[modules.usage]
+# Global gate for usage collection. Set this to true before enabling usage
+# on individual hosts; per-host modules.usage.enabled can only opt hosts out.
+enabled = false
+interval = "5m"
+timeout = "5s"
+# Verify SSH host keys for usage collection by default. Set this to false only
+# for environments where host keys are unreliable.
+ssh_verify_host_key = true
+# Maximum simultaneous usage SSH probes. This is separate from ICMP checks.
+concurrency = 32
+# Per-poll samples are kept for this long. Old samples are pruned inside
+# the same write transaction so the table stays bounded. Change events
+# (usage_history) are not pruned.
+sample_retention = "30d"
+linux_min_uid = 1000
+macos_min_uid = 500
+
+[[hosts]]
+id = "router-core-1"
+address = "192.0.2.1"
+name = "Core Router 1"
+metadata = { room = "net-a", rack = "rack-1" }
+
+# Usage OS defaults to autodetection with `uname -s`. Set os = "linux" or
+# os = "macos" here only when you want to skip the probe for this host.
+[hosts.modules.usage]
+enabled = false
+interval = "5m"
+
+[[hosts]]
+id = "switch-edge-1"
+address = "192.0.2.2"
+name = "Edge Switch 1"
+metadata = { room = "lab-2" }
+
+# Groups can also be declared at the top level. Each host's effective
+# group list is the union of its inline `groups = [...]` and any
+# [groups] entries that name its id. Empty member lists are rejected.
+[groups]
+core = ["router-core-1"]
+routers = ["router-core-1"]
+edge = ["switch-edge-1"]
+switches = ["switch-edge-1"]
+
+# Group-level settings apply between global settings and per-host
+# [hosts.modules.usage] settings. Keep host-key verification enabled unless
+# an isolated legacy environment cannot maintain known-host entries.
+[group_settings.edge.modules.usage]
+ssh_verify_host_key = true

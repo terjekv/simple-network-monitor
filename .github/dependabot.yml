@@ -22,3 +22,7 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: ci
+    groups:
+      codeql:
+        patterns:
+          - github/codeql-action/*

@@ -1,20 +1,31 @@
 Name:           simple-network-monitor
-Version:        0.0.1
-Release:        1%{?dist}
+Version:        %{?package_version}%{!?package_version:0.0.1}
+Release:        %{?package_release}%{!?package_release:1%{?dist}}
 Summary:        Simple ICMP and usage monitoring daemon with a JSON API
 
 %global debug_package %{nil}
+%global __requires_exclude ^rtld\\(GNU_HASH\\)$
 %bcond_with local_cargo
+%bcond_with prebuilt
+%if %{with prebuilt}
+# Preserve the already stripped and statically verified release executable.
+%global __strip /bin/true
+%endif
 
 License:        MIT
 Source0:        %{name}-%{version}.tar.gz
+%if %{with prebuilt}
+Source1:        %{name}
+%endif
 
+%if !%{with prebuilt}
 %if !%{with local_cargo}
 BuildRequires:  cargo
 BuildRequires:  rust
 %endif
-BuildRequires:  systemd-rpm-macros
 BuildRequires:  gcc
+%endif
+BuildRequires:  systemd-rpm-macros
 Requires(pre):  shadow-utils
 %{?systemd_requires}
 
@@ -30,11 +41,20 @@ history through a JSON API.
 %autosetup
 
 %build
+%if %{with prebuilt}
+:
+%else
 cargo build --release --locked
+%endif
 
 %install
+%if %{with prebuilt}
+install -Dpm0755 %{SOURCE1} \
+    %{buildroot}%{_bindir}/simple-network-monitor
+%else
 install -Dpm0755 target/release/simple-network-monitor \
     %{buildroot}%{_bindir}/simple-network-monitor
+%endif
 
 install -Dpm0644 monitor.example.toml \
     %{buildroot}%{_sysconfdir}/simple-network-monitor/monitor.toml
@@ -49,7 +69,13 @@ sed -i 's#/usr/local/bin/simple-network-monitor#%{_bindir}/simple-network-monito
 mkdir -p %{buildroot}%{_sharedstatedir}/simple-network-monitor
 
 %check
+%if %{with prebuilt}
+%{buildroot}%{_bindir}/simple-network-monitor \
+    --config monitor.example.toml \
+    --verify-config-only
+%else
 cargo test --release --locked
+%endif
 
 %pre
 getent group simple-network-monitor >/dev/null || \

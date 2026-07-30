@@ -1,0 +1,483 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  validate:
+    name: Test, lint, and validate
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Lint GitHub Actions workflows
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Validate example config
+        run: cargo run --locked -- --config monitor.example.toml --verify-config-only
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --no-deps
+
+      - name: Validate tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must look like v1.2.3 or v1.2.3-rc.1: $tag" >&2
+            exit 1
+          fi
+
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq --raw-output '.packages[] | select(.name == "simple-network-monitor") | .version'
+          )"
+          if [[ "$tag" != "v${version}" ]]; then
+            echo "tag $tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tagged commit $GITHUB_SHA is not on origin/main" >&2
+            exit 1
+          fi
+
+          successful_run_count="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha=${GITHUB_SHA}&status=completed&per_page=100" \
+              --jq '[.workflow_runs[] | select(.conclusion == "success")] | length'
+          )"
+          if [[ "$successful_run_count" -eq 0 ]]; then
+            echo "tagged commit $GITHUB_SHA has no successful CI workflow run on main" >&2
+            exit 1
+          fi
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Reject newly introduced vulnerable dependencies
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+
+  rustsec:
+    name: RustSec audit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install pinned cargo-audit
+        run: cargo install --locked --version "$CARGO_AUDIT_VERSION" cargo-audit
+
+      - name: Audit locked dependencies
+        run: cargo audit --deny warnings
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    if: "!startsWith(github.ref, 'refs/tags/')"
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - rust
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable Rust toolchain
+        if: matrix.language == 'rust'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  build-linux:
+    name: Build ${{ matrix.target }}
+    if: >-
+      always() &&
+      needs.validate.result == 'success' &&
+      needs.rustsec.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') || needs.codeql.result == 'success') &&
+      github.event_name != 'pull_request' &&
+      github.event_name != 'schedule' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - codeql
+      - rustsec
+      - validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Prepare artifact metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(
+            sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml |
+              head -n 1
+          )"
+          test -n "$version"
+          rpm_version="${version//-/~}"
+          short_sha="${GITHUB_SHA:0:7}"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            label="$GITHUB_REF_NAME"
+            rpm_release="1"
+            retention_days="90"
+          else
+            label="main"
+            rpm_release="0.main.${GITHUB_RUN_NUMBER}.g${short_sha}"
+            retention_days="14"
+          fi
+
+          asset_base="simple-network-monitor-${label}-${{ matrix.target }}"
+          {
+            echo "asset_base=$asset_base"
+            echo "label=$label"
+            echo "rpm_release=$rpm_release"
+            echo "rpm_version=$rpm_version"
+            echo "retention_days=$retention_days"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Export stripped static binary
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: packaging/static/Dockerfile
+          target: release-artifacts
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=dist/bin
+          cache-from: type=gha,scope=static-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=static-${{ matrix.target }}
+
+      - name: Verify static linkage and executable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary="dist/bin/simple-network-monitor"
+          test -x "$binary"
+          file "$binary"
+
+          if readelf --dynamic "$binary" | grep '(NEEDED)' >/dev/null; then
+            echo "$binary unexpectedly has dynamic runtime dependencies" >&2
+            readelf --dynamic "$binary" >&2
+            exit 1
+          fi
+          if readelf --program-headers "$binary" | grep ' INTERP ' >/dev/null; then
+            echo "$binary unexpectedly has a dynamic program interpreter" >&2
+            readelf --program-headers "$binary" >&2
+            exit 1
+          fi
+
+          "$binary" --version
+          "$binary" --config monitor.example.toml --verify-config-only
+
+      - name: Package standalone binary
+        env:
+          ASSET_BASE: ${{ steps.metadata.outputs.asset_base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          stage="${RUNNER_TEMP}/${ASSET_BASE}"
+          mkdir -p "$stage"
+          install -m 0755 dist/bin/simple-network-monitor "$stage/simple-network-monitor"
+          install -m 0644 LICENSE README.md monitor.example.toml "$stage/"
+          {
+            printf 'source_ref=%s\n' "$GITHUB_REF"
+            printf 'source_commit=%s\n' "$GITHUB_SHA"
+            printf 'target=%s\n' "${{ matrix.target }}"
+            printf 'rust_image=%s\n' 'rust:1.97.0-alpine3.24'
+          } > "$stage/BUILD-INFO"
+
+          tar \
+            --create \
+            --gzip \
+            --file "dist/${ASSET_BASE}.tar.gz" \
+            --directory "$RUNNER_TEMP" \
+            "$ASSET_BASE"
+          pushd dist >/dev/null
+          sha256sum "${ASSET_BASE}.tar.gz" > "${ASSET_BASE}.tar.gz.sha256"
+          popd >/dev/null
+
+      - name: Install RPM inspection tools
+        run: |
+          sudo apt-get update --yes
+          sudo apt-get install --yes cpio rpm
+
+      - name: Build RPM around static binary
+        env:
+          ASSET_BASE: ${{ steps.metadata.outputs.asset_base }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.rpm_version }}
+          PACKAGE_RELEASE: ${{ steps.metadata.outputs.rpm_release }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rpm_topdir="${RUNNER_TEMP}/rpmbuild"
+          source_archive="${RUNNER_TEMP}/simple-network-monitor-${PACKAGE_VERSION}.tar.gz"
+          mkdir -p "$rpm_topdir"
+          git archive \
+            --format=tar.gz \
+            --prefix="simple-network-monitor-${PACKAGE_VERSION}/" \
+            --output="$source_archive" \
+            HEAD
+
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --volume "${rpm_topdir}:/rpmbuild" \
+            --volume "${source_archive}:/source/simple-network-monitor.tar.gz:ro" \
+            --env RPM_TOPDIR=/rpmbuild \
+            --env RPM_PREBUILT_BINARY=/workspace/dist/bin/simple-network-monitor \
+            --env RPM_SOURCE_ARCHIVE=/source/simple-network-monitor.tar.gz \
+            --env RPM_PACKAGE_VERSION="$PACKAGE_VERSION" \
+            --env RPM_PACKAGE_RELEASE="$PACKAGE_RELEASE" \
+            quay.io/rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6 \
+            bash -euxo pipefail -c '
+              dnf install --assumeyes rpm-build systemd-rpm-macros
+              cd /workspace
+              scripts/build-rpm.sh
+            '
+
+          mapfile -t rpm_files < <(find "$rpm_topdir/RPMS" -type f -name '*.rpm' -print)
+          if [[ "${#rpm_files[@]}" -ne 1 ]]; then
+            echo "expected one binary RPM, found ${#rpm_files[@]}" >&2
+            printf '%s\n' "${rpm_files[@]}" >&2
+            exit 1
+          fi
+
+          install -m 0644 "${rpm_files[0]}" "dist/${ASSET_BASE}.rpm"
+          rpm --query --package --info "dist/${ASSET_BASE}.rpm"
+          rpm --query --package --requires "dist/${ASSET_BASE}.rpm"
+
+          payload_dir="${RUNNER_TEMP}/rpm-payload"
+          mkdir -p "$payload_dir"
+          rpm2cpio "dist/${ASSET_BASE}.rpm" |
+            cpio \
+              --quiet \
+              --directory "$payload_dir" \
+              --make-directories \
+              --extract \
+              './usr/bin/simple-network-monitor'
+          cmp \
+            dist/bin/simple-network-monitor \
+            "$payload_dir/usr/bin/simple-network-monitor"
+
+          pushd dist >/dev/null
+          sha256sum "${ASSET_BASE}.rpm" > "${ASSET_BASE}.rpm.sha256"
+          popd >/dev/null
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-${{ matrix.target }}-${{ steps.metadata.outputs.label }}
+          path: |
+            dist/*.rpm
+            dist/*.sha256
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ steps.metadata.outputs.retention_days }}
+
+  publish-main:
+    name: Publish main-latest release
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - build-linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download main artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: linux-*-main
+          merge-multiple: true
+          path: dist
+
+      - name: Build aggregate checksums
+        run: |
+          cd dist
+          sha256sum ./*.rpm ./*.tar.gz > SHA256SUMS
+
+      - name: Move rolling tag and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/main-latest" >/dev/null 2>&1; then
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/main-latest" \
+              --field sha="$GITHUB_SHA" \
+              --field force=true >/dev/null
+          else
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              --field ref=refs/tags/main-latest \
+              --field sha="$GITHUB_SHA" >/dev/null
+          fi
+
+          notes="Rolling build of \`main\` at commit \`${GITHUB_SHA}\`. These artifacts are prerelease snapshots."
+          if gh release view main-latest >/dev/null 2>&1; then
+            gh release edit main-latest \
+              --title "Latest main build" \
+              --notes "$notes" \
+              --prerelease
+          else
+            gh release create main-latest \
+              --verify-tag \
+              --title "Latest main build" \
+              --notes "$notes" \
+              --prerelease \
+              --latest=false
+          fi
+          gh release upload main-latest dist/* --clobber
+
+  publish-tag:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download tagged artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: linux-*-${{ github.ref_name }}
+          merge-multiple: true
+          path: dist
+
+      - name: Build aggregate checksums
+        run: |
+          cd dist
+          sha256sum ./*.rpm ./*.tar.gz > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          elif [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --prerelease \
+              --latest=false
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --latest
+          fi

@@ -1,0 +1,17 @@
+.git
+.agents
+.claude
+.codex
+.split-staging
+target
+dist
+.env
+.env.*
+*.db
+*.key
+*.pem
+*.sqlite3
+*.sqlite3-*
+monitor.toml
+monitor.*.toml
+!monitor.example.toml

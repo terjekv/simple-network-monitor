@@ -2,6 +2,8 @@
 
 Rust daemon that monitors configured hosts with ICMP and exposes latest status plus transition history over JSON.
 
+[![CI](https://github.com/terjekv/simple-network-monitor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/terjekv/simple-network-monitor/actions/workflows/ci.yml)
+
 ## Run
 
 ```sh
@@ -22,6 +24,15 @@ make rpm
 ```
 
 Run `make help` for the full target list.
+
+## Continuous integration and security
+
+Pull requests and `main` are checked with rustfmt, Clippy, the full test suite,
+documentation warnings, example-config validation, strict RustSec auditing,
+dependency review, and CodeQL analysis of both Rust and GitHub Actions.
+Security checks also run weekly so newly published advisories are detected even
+when the source does not change. Dependabot proposes updates for Cargo
+dependencies and pinned GitHub Actions.
 
 ## systemd deployment
 
@@ -109,6 +120,32 @@ database_path = "/var/lib/simple-network-monitor/network-monitor.sqlite3"
 
 After installing, edit `/etc/simple-network-monitor/monitor.toml` for the host
 list and any local polling/API settings.
+
+## Portable Linux artifacts
+
+GitHub Actions builds stripped, statically linked musl binaries for
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. Each build is
+checked for both dynamic library dependencies and a dynamic program
+interpreter, then published as a standalone tarball and an RPM with SHA-256
+checksums.
+
+- Pushes to `main` update the rolling
+  [`main-latest`](https://github.com/terjekv/simple-network-monitor/releases/tag/main-latest)
+  prerelease.
+- Tags such as `v0.0.1` publish a versioned release. The tag must
+  match the version in `Cargo.toml`, point to `main`, and already have a
+  successful `main` artifact workflow run.
+
+The musl executable does not depend on the target system's glibc or shared
+libraries. It still requires a compatible Linux kernel and any external
+programs used by configured modules: the system ICMP backend invokes `ping`,
+and usage collection invokes `ssh`.
+
+The RPM embeds the same verified static executable and is broadly portable
+across modern systemd-based RPM distributions. It is not a distribution-neutral
+package: installation still uses RPM/systemd conventions and declares runtime
+dependencies on `shadow-utils`, `iputils`, and optionally OpenSSH. Use the
+standalone tarball on non-RPM distributions.
 
 After replacing a config file for a running daemon, send `SIGHUP` to reload it.
 Reload validates the new config before changing shared state; invalid configs are

@@ -287,7 +287,7 @@ jobs:
             printf 'source_ref=%s\n' "$GITHUB_REF"
             printf 'source_commit=%s\n' "$GITHUB_SHA"
             printf 'target=%s\n' "${{ matrix.target }}"
-            printf 'rust_image=%s\n' 'rust:1.97.1-alpine3.24'
+            printf 'rust_image=%s\n' 'rust:1.98.1-alpine3.24'
           } > "$stage/BUILD-INFO"
 
           tar \

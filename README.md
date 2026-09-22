@@ -154,7 +154,12 @@ usage settings, and API token reload. `bind` and `database_path` changes are
 logged but still require a process restart. `api_workers` also requires a
 restart because Actix worker threads are created when the HTTP server starts.
 
-The API binds to `127.0.0.1:3000` by default:
+The API serves HTTP/1.1 and binds to `127.0.0.1:3000` by default. Use a reverse
+proxy for TLS or HTTP/2, with HTTP/1.1 connections to the monitor. The build
+omits Actix's optional HTTP/2 support to exclude the vulnerable `h2` 0.3
+dependency ([RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html)).
+
+For example:
 
 ```sh
 curl http://127.0.0.1:3000/healthz

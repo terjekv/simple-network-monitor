@@ -3,6 +3,7 @@
 # Unknown keys in any [table] or [[hosts]] block are rejected at startup
 # (deny_unknown_fields) so typos surface immediately. Group named tables
 # under [groups]; everything else goes at the top level or inside hosts.
+# HTTP/1.1 listener. Use a reverse proxy for TLS or HTTP/2.
 bind = "127.0.0.1:3000"
 database_path = "./network-monitor.sqlite3"
 # Optional. Limits Actix HTTP API worker threads. Omit to use Actix's default,

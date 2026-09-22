@@ -31,8 +31,11 @@ content suitable for publication:
   considering a behavior change complete.
 - Keep `Cargo.lock` committed for reproducible application builds.
 - Run `actionlint` after changing GitHub Actions workflows.
-- Use the latest supported major-version refs for GitHub Actions (for example,
-  `actions/checkout@v7`) and keep container images pinned to immutable digests.
+- Use the latest supported major versions of GitHub Actions. First-party
+  GitHub Actions may use major-version refs (for example, `actions/checkout@v7`).
+  Pin third-party actions to full commit SHAs from verified upstream releases,
+  with the release version in a comment. Keep container images pinned to
+  immutable digests.
 - Preserve the static-link checks when changing Linux artifact builds.
 
 ## Security and dependencies
@@ -47,7 +50,8 @@ content suitable for publication:
   why the affected code is unreachable or otherwise non-exploitable here.
 - Keep CI permissions minimal. Do not weaken CodeQL, dependency review,
   RustSec, static-link, or release-gating checks merely to make CI green.
-- Keep third-party GitHub Actions on their latest supported major-version refs.
+- Keep third-party GitHub Action commit pins on releases from the latest
+  supported major version, and update their version comments with the pins.
   Keep Dependabot configured for both Cargo and GitHub Actions updates so major
   upgrades remain visible.
 

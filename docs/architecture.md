@@ -9,10 +9,13 @@ over Actix JSON routes.
 - `config` owns all TOML parsing and semantic validation. Keep validation
   explicit: parse raw types first, validate, then build `AppConfig`.
 - `domain` contains transport- and storage-independent types.
-- `backends` implements probing details behind narrow traits.
+- `backends` implements probing details behind narrow traits and typed
+  `domain::check::Check` adapters. TCP and raw ICMP share bounded DNS admission.
 - `modules` owns module metadata, config docs, filter docs, enabled-state
-  checks, route registration, and monitor spawning for ICMP and usage.
-- `app` owns filter parsing and the filter registry. Monitor loops live under `modules`.
+  checks, route registration, dependency preparation, and monitor spawning for
+  ICMP, usage, and named TCP checks.
+- `app` owns filter parsing, the filter registry, and process-lifetime execution
+  metrics. `modules::runner` owns common scheduling and durable-write retries.
 - `storage` owns persistence behind repository traits.
 - `api` owns HTTP routes, DTOs, auth, errors, and OpenAPI annotations.
 
@@ -60,6 +63,8 @@ currently have separate purposes:
 - `latest_status`: latest ICMP state for each host.
 - `transitions`: ICMP history.
 - `latest_usage`: latest usage snapshot for each host.
+- `latest_tcp`: latest observation keyed by host and check ID, with address and
+  port identity. Schema v3 adds this table without modifying v2 observations.
 - `usage_history`: usage change events.
 - `usage_samples`: every retained usage poll sample.
 - `usage_coverage`: start and latest timestamp of continuous collection.
@@ -117,3 +122,18 @@ for retry; ICMP transition identity makes repeating a write idempotent.
 Periodic maintenance prunes bounded batches independent of active polling.
 Inactivity evaluation is bounded by retained history so a removed event cannot turn a
 long inactivity window into a false affirmative result. Migration is transactional.
+
+
+The authenticated `/metrics` endpoint reads the same repository observations as
+host responses, then emits fixed Prometheus metric families. It performs no
+network checks. Freshness gauges and observation timestamps distinguish stopped
+collection from failed targets. Module execution counters and histograms are
+shared across API workers and reloads, and count completed observations before
+persistence retries. Labels contain stable host/check IDs and bounded enums;
+free-form diagnostic text and inventory metadata are excluded.
+
+TCP identities include host address, check ID, and port. Inventory synchronization
+clears results for changed/disabled/removed checks in the same transaction as the
+host inventory. Monitor repositories enforce the existing generation guard on TCP
+writes. A restart with unchanged identity retains current observations. Readiness
+counts each enabled named TCP check separately.

@@ -1,12 +1,18 @@
 use crate::{
+    app::telemetry::RuntimeMetrics,
+    backends::check::UsageCheck,
+    domain::check::Check,
+    modules::runner::{self, MonitorJob},
+};
+use crate::{
     backends::usage::{UsageCollectionRequest, UsageCollector},
     domain::{Host, UsageCollectionStatus, UsageSnapshot},
     storage::UsageRepository,
 };
+use async_trait::async_trait;
 use chrono::Utc;
-use rand::RngExt;
 use std::{sync::Arc, time::Duration};
-use tokio::{sync::Semaphore, task::JoinSet, time};
+use tokio::{sync::Semaphore, task::JoinSet};
 
 #[derive(Clone, Debug)]
 pub struct UsageMonitorConfig {
@@ -18,6 +24,7 @@ pub async fn run_usage_monitor(
     config: UsageMonitorConfig,
     collector: Arc<dyn UsageCollector>,
     usage_repository: Arc<dyn UsageRepository>,
+    metrics: Arc<RuntimeMetrics>,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.concurrency));
     let mut tasks = JoinSet::new();
@@ -26,58 +33,53 @@ pub async fn run_usage_monitor(
         let collector = Arc::clone(&collector);
         let usage_repository = Arc::clone(&usage_repository);
         let semaphore = Arc::clone(&semaphore);
+        let metrics = metrics.clone();
         tasks.spawn(async move {
-            monitor_usage(host, collector, usage_repository, semaphore).await;
+            runner::run_job(
+                UsageJob {
+                    host,
+                    collector,
+                    repository: usage_repository,
+                },
+                semaphore,
+                metrics,
+            )
+            .await;
         });
     }
 
-    if let Some(result) = tasks.join_next().await {
-        tracing::error!(
-            ?result,
-            "host monitor exited; stopping module so supervision can restart the service"
-        );
-        tasks.shutdown().await;
-    }
+    runner::supervise(tasks).await;
 }
 
-async fn monitor_usage(
+struct UsageJob {
     host: Host,
     collector: Arc<dyn UsageCollector>,
-    usage_repository: Arc<dyn UsageRepository>,
-    semaphore: Arc<Semaphore>,
-) {
-    jitter(host.modules.usage.interval).await;
-    let mut interval = time::interval(host.modules.usage.interval);
-    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    loop {
-        interval.tick().await;
-        let Ok(_permit) = semaphore.acquire().await else {
-            return;
-        };
-        let snapshot = collect_once(&host, collector.as_ref()).await;
-        loop {
-            match usage_repository
-                .update_usage(&host.id, snapshot.clone())
-                .await
-            {
-                Ok(changed) => {
-                    if changed && snapshot.status == UsageCollectionStatus::Failed {
-                        tracing::warn!(
-                            host_id = %host.id,
-                            collector = collector.name(),
-                            error = %snapshot.error.as_deref().unwrap_or("unknown usage collection error"),
-                            "usage collection failed"
-                        );
-                    }
-                    break;
-                }
-                Err(crate::storage::StorageError::StaleGeneration) => return,
-                Err(err) => {
-                    tracing::error!(host_id = %host.id, %err, "failed to store usage result; retrying");
-                    time::sleep(Duration::from_millis(250)).await;
-                }
-            }
+    repository: Arc<dyn UsageRepository>,
+}
+
+#[async_trait]
+impl MonitorJob for UsageJob {
+    type Observation = UsageSnapshot;
+    fn kind(&self) -> &'static str {
+        "usage"
+    }
+    fn interval(&self) -> Duration {
+        self.host.modules.usage.interval
+    }
+    async fn observe(&mut self) -> (UsageSnapshot, bool) {
+        let snapshot = collect_once(&self.host, self.collector.as_ref()).await;
+        let success = snapshot.status == UsageCollectionStatus::Ok;
+        (snapshot, success)
+    }
+    async fn persist(&self, snapshot: &UsageSnapshot) -> Result<(), crate::storage::StorageError> {
+        let changed = self
+            .repository
+            .update_usage(&self.host.id, snapshot.clone())
+            .await?;
+        if changed && snapshot.status == UsageCollectionStatus::Failed {
+            tracing::warn!(host_id = %self.host.id, collector = self.collector.name(), error = ?snapshot.error, "usage collection failed");
         }
+        Ok(())
     }
 }
 
@@ -93,7 +95,7 @@ pub async fn collect_once(host: &Host, collector: &dyn UsageCollector) -> UsageS
         macos_min_uid: host.modules.usage.macos_min_uid,
     };
 
-    match collector.collect(&request).await {
+    match UsageCheck(collector).run(&request).await {
         Ok(counts) => {
             tracing::debug!(
                 host_id = %host.id,
@@ -105,14 +107,6 @@ pub async fn collect_once(host: &Host, collector: &dyn UsageCollector) -> UsageS
             UsageSnapshot::success(collected_at, counts.console_users, counts.remote_users)
         }
         Err(err) => UsageSnapshot::error(collected_at, err.message),
-    }
-}
-
-async fn jitter(interval: Duration) {
-    let max_millis = (interval.as_millis() / 10).min(2_000) as u64;
-    if max_millis > 0 {
-        let delay = rand::rng().random_range(0..=max_millis);
-        time::sleep(Duration::from_millis(delay)).await;
     }
 }
 

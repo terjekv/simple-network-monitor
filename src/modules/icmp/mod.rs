@@ -1,18 +1,20 @@
 mod monitor;
 
+use crate::backends::ping::{PingBackend, build_backend};
 use crate::{
     AppConfig,
     api::routes,
     app::FilterKeyMetadata,
     config::BackendKind,
     modules::{
-        ConfigOptionDoc, ModuleMetadata, ModuleRuntimeContext, MonitorModule, SpawnedMonitor,
+        ConfigOptionDoc, ModuleMetadata, ModuleRuntimeContext, MonitorModule, PreparedMonitor,
+        SpawnedMonitor,
     },
 };
 use actix_web::web;
 use monitor::{IcmpMonitorConfig, run_icmp_monitor};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +74,7 @@ impl Default for IcmpModuleConfig {
 
 pub struct IcmpModule;
 
+#[async_trait::async_trait]
 impl MonitorModule for IcmpModule {
     fn metadata(&self) -> ModuleMetadata {
         ModuleMetadata {
@@ -152,38 +155,64 @@ impl MonitorModule for IcmpModule {
         cfg.service(routes::host_history);
     }
 
-    fn spawn_monitor(&self, context: ModuleRuntimeContext<'_>) -> Option<SpawnedMonitor> {
-        if !self.globally_enabled(context.config) || !self.has_enabled_hosts(context.config) {
-            return None;
+    async fn prepare(
+        &self,
+        config: &AppConfig,
+    ) -> std::io::Result<Option<Box<dyn PreparedMonitor>>> {
+        if !self.globally_enabled(config) || !self.has_enabled_hosts(config) {
+            return Ok(None);
         }
-        let Some(ping_backend) = context.ping_backend else {
-            tracing::error!("ICMP monitor requested without a ping backend");
-            return None;
-        };
+        let backend = Arc::from(
+            build_backend(config.modules.icmp.backend)
+                .await
+                .map_err(std::io::Error::other)?,
+        );
+        Ok(Some(Self::prepare_with_backend(config, backend)))
+    }
+}
 
-        let hosts = context
-            .config
-            .hosts
-            .iter()
-            .filter(|host| host.modules.icmp.enabled)
-            .cloned()
-            .collect();
-        let monitor_config = IcmpMonitorConfig {
-            concurrency: context.config.modules.icmp.concurrency,
-            failure_threshold: context.config.modules.icmp.failure_threshold,
-            success_threshold: context.config.modules.icmp.success_threshold,
-        };
-        let handle = tokio::spawn(run_icmp_monitor(
-            hosts,
-            monitor_config,
-            ping_backend,
-            context.host_repository,
-            context.icmp_repository,
-        ));
-        Some(SpawnedMonitor {
-            kind: "icmp",
-            handle,
+impl IcmpModule {
+    /// Prepare with an injected backend; useful for embedders and deterministic tests.
+    pub fn prepare_with_backend(
+        config: &AppConfig,
+        backend: Arc<dyn PingBackend>,
+    ) -> Box<dyn PreparedMonitor> {
+        Box::new(PreparedIcmp {
+            hosts: config
+                .hosts
+                .iter()
+                .filter(|host| host.modules.icmp.enabled)
+                .cloned()
+                .collect(),
+            config: IcmpMonitorConfig {
+                concurrency: config.modules.icmp.concurrency,
+                failure_threshold: config.modules.icmp.failure_threshold,
+                success_threshold: config.modules.icmp.success_threshold,
+            },
+            backend,
         })
+    }
+}
+
+struct PreparedIcmp {
+    hosts: Vec<crate::domain::Host>,
+    config: IcmpMonitorConfig,
+    backend: Arc<dyn PingBackend>,
+}
+
+impl PreparedMonitor for PreparedIcmp {
+    fn spawn(self: Box<Self>, context: ModuleRuntimeContext) -> SpawnedMonitor {
+        SpawnedMonitor {
+            kind: "icmp",
+            handle: tokio::spawn(run_icmp_monitor(
+                self.hosts,
+                self.config,
+                self.backend,
+                context.host_repository,
+                context.icmp_repository,
+                context.metrics,
+            )),
+        }
     }
 }
 

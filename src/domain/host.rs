@@ -22,6 +22,8 @@ pub struct Host {
 pub struct HostModuleConfig {
     pub icmp: ResolvedIcmpHostConfig,
     pub usage: ResolvedUsageHostConfig,
+    #[serde(default)]
+    pub tcp: super::tcp::ResolvedTcpHostConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +57,7 @@ impl HostRuntimeState {
             host: host.clone(),
             state: self.clone(),
             usage,
+            tcp: Default::default(),
         }
     }
 }
@@ -64,6 +67,7 @@ pub struct HostRecord {
     pub host: Host,
     pub state: HostRuntimeState,
     pub usage: Option<UsageSnapshot>,
+    pub tcp: std::collections::BTreeMap<super::tcp::CheckId, super::tcp::TcpSnapshot>,
 }
 
 pub fn duration_ms(duration: Duration) -> f64 {
@@ -108,6 +112,7 @@ impl Host {
         ] {
             validate_duration(duration)?;
         }
+        self.modules.tcp.validate()?;
         Ok(())
     }
 }

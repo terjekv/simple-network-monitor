@@ -1,6 +1,7 @@
 mod auth;
 mod dto;
 mod errors;
+mod metrics;
 mod openapi;
 pub(crate) mod routes;
 
@@ -16,6 +17,7 @@ pub use errors::ApiError;
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub metrics: Arc<crate::app::telemetry::RuntimeMetrics>,
     pub hosts: Arc<dyn HostRepository>,
     pub icmp: Arc<dyn IcmpRepository>,
     pub usage: Arc<dyn UsageRepository>,
@@ -24,6 +26,7 @@ pub struct ApiState {
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(metrics::metrics);
     routes::configure(cfg);
     openapi::configure(cfg);
 }
@@ -51,6 +54,7 @@ mod tests {
 
     fn api_state(storage: Arc<SqliteStorage>, api_token: Option<&str>) -> ApiState {
         ApiState {
+            metrics: Arc::new(crate::app::telemetry::RuntimeMetrics::default()),
             hosts: storage.clone(),
             icmp: storage.clone(),
             usage: storage,
@@ -185,7 +189,7 @@ mod tests {
         let resp = actix_test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = actix_test::read_body_json(resp).await;
-        assert_eq!(body["modules"].as_array().unwrap().len(), 2);
+        assert_eq!(body["modules"].as_array().unwrap().len(), 3);
         assert!(
             body["modules"].as_array().unwrap().iter().any(|module| {
                 module["id"] == "icmp" && module["filters"]["status"].is_object()

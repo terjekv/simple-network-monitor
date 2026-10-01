@@ -41,6 +41,14 @@ sample_retention = "30d"
 linux_min_uid = 1000
 macos_min_uid = 500
 
+[modules.tcp]
+# Enable globally to activate the named checks configured on each host.
+enabled = false
+interval = "30s"
+# Includes DNS resolution and all connection attempts.
+timeout = "3s"
+concurrency = 64
+
 [[hosts]]
 id = "router-core-1"
 address = "192.0.2.1"
@@ -52,6 +60,11 @@ metadata = { room = "net-a", rack = "rack-1" }
 [hosts.modules.usage]
 enabled = false
 interval = "5m"
+
+# Names are stable within this host's TCP module; ports must be 1..65535.
+# Up to 64 checks per host. With the global gate off these remain disabled.
+[hosts.modules.tcp]
+checks = [{ id = "ssh", port = 22 }, { id = "web", port = 443 }]
 
 [[hosts]]
 id = "switch-edge-1"

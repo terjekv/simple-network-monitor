@@ -44,6 +44,7 @@ pub struct HostResponse {
     pub usage_enabled: bool,
     pub icmp_stale: bool,
     pub usage_stale: bool,
+    pub tcp: Vec<TcpCheckResponse>,
 }
 
 impl From<HostRecord> for HostResponse {
@@ -65,7 +66,36 @@ impl From<HostRecord> for HostResponse {
                 record.host.modules.usage.timeout,
                 now,
             );
+        let tcp = record
+            .host
+            .modules
+            .tcp
+            .checks
+            .iter()
+            .map(|check| {
+                let snapshot = record.tcp.get(&check.id);
+                TcpCheckResponse {
+                    id: check.id.as_str().to_owned(),
+                    port: check.port.get(),
+                    enabled: record.host.modules.tcp.enabled,
+                    stale: !record.host.modules.tcp.enabled
+                        || !crate::domain::host::is_fresh(
+                            snapshot.map(|s| s.observed_at()),
+                            record.host.modules.tcp.interval,
+                            record.host.modules.tcp.timeout,
+                            now,
+                        ),
+                    observation: snapshot.map(|s| TcpObservationResponse {
+                        observed_at: s.observed_at(),
+                        success: s.success(),
+                        duration_seconds: s.duration().map(|d| d.as_secs_f64()),
+                        error: s.error().map(str::to_owned),
+                    }),
+                }
+            })
+            .collect();
         Self {
+            tcp,
             icmp_enabled,
             usage_enabled,
             icmp_stale,
@@ -346,4 +376,21 @@ pub struct ReadinessResponse {
     pub status: &'static str,
     pub enabled_checks: usize,
     pub current_checks: usize,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct TcpCheckResponse {
+    pub id: String,
+    pub port: u16,
+    pub enabled: bool,
+    pub stale: bool,
+    pub observation: Option<TcpObservationResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct TcpObservationResponse {
+    pub observed_at: DateTime<Utc>,
+    pub success: bool,
+    pub duration_seconds: Option<f64>,
+    pub error: Option<String>,
 }

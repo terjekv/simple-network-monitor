@@ -1,10 +1,16 @@
 use crate::{
+    app::telemetry::RuntimeMetrics,
+    backends::check::PingCheck,
+    domain::check::Check,
+    modules::runner::{self, MonitorJob},
+};
+use crate::{
     backends::ping::{PingBackend, PingCheckRequest},
     domain::{Host, HostRuntimeState, HostStatus, IcmpTransition, duration_ms},
     storage::{HostRepository, IcmpRepository},
 };
+use async_trait::async_trait;
 use chrono::Utc;
-use rand::RngExt;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, task::JoinSet, time};
 
@@ -21,6 +27,7 @@ pub async fn run_icmp_monitor(
     backend: Arc<dyn PingBackend>,
     host_repository: Arc<dyn HostRepository>,
     icmp_repository: Arc<dyn IcmpRepository>,
+    metrics: Arc<RuntimeMetrics>,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.concurrency));
     let mut tasks = JoinSet::new();
@@ -31,6 +38,7 @@ pub async fn run_icmp_monitor(
         let icmp_repository = Arc::clone(&icmp_repository);
         let semaphore = Arc::clone(&semaphore);
         let config = config.clone();
+        let metrics = metrics.clone();
         tasks.spawn(async move {
             monitor_host(
                 host,
@@ -39,18 +47,13 @@ pub async fn run_icmp_monitor(
                 host_repository,
                 icmp_repository,
                 semaphore,
+                metrics,
             )
             .await;
         });
     }
 
-    if let Some(result) = tasks.join_next().await {
-        tracing::error!(
-            ?result,
-            "host monitor exited; stopping module so supervision can restart the service"
-        );
-        tasks.shutdown().await;
-    }
+    runner::supervise(tasks).await;
 }
 
 async fn monitor_host(
@@ -60,9 +63,9 @@ async fn monitor_host(
     host_repository: Arc<dyn HostRepository>,
     icmp_repository: Arc<dyn IcmpRepository>,
     semaphore: Arc<Semaphore>,
+    metrics: Arc<RuntimeMetrics>,
 ) {
-    jitter(host.modules.icmp.interval).await;
-    let mut state = loop {
+    let state = loop {
         match host_repository.host(&host.id).await {
             Ok(Some(record)) => break record.state,
             Err(crate::storage::StorageError::Busy) => time::sleep(Duration::from_millis(25)).await,
@@ -77,29 +80,57 @@ async fn monitor_host(
         }
     };
 
-    let mut interval = time::interval(host.modules.icmp.interval);
-    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    loop {
-        interval.tick().await;
-        let Ok(_permit) = semaphore.acquire().await else {
-            return;
-        };
-        let transition = check_once(&host, &config, backend.as_ref(), &mut state).await;
-        // Do not take another observation until this one is durably recorded.
-        // A retry uses the same state and event identity, preserving transition order.
-        loop {
-            match icmp_repository
-                .update_check_result(&host.id, state.clone(), transition.clone())
-                .await
-            {
-                Ok(()) => break,
-                Err(crate::storage::StorageError::StaleGeneration) => return,
-                Err(err) => {
-                    tracing::error!(host_id = %host.id, %err, "failed to store check result; retrying");
-                    time::sleep(Duration::from_millis(250)).await;
-                }
-            }
-        }
+    runner::run_job(
+        IcmpJob {
+            host,
+            config,
+            backend,
+            repository: icmp_repository,
+            state,
+        },
+        semaphore,
+        metrics,
+    )
+    .await;
+}
+
+struct IcmpJob {
+    host: Host,
+    config: IcmpMonitorConfig,
+    backend: Arc<dyn PingBackend>,
+    repository: Arc<dyn IcmpRepository>,
+    state: HostRuntimeState,
+}
+
+#[async_trait]
+impl MonitorJob for IcmpJob {
+    type Observation = (HostRuntimeState, Option<IcmpTransition>);
+    fn kind(&self) -> &'static str {
+        "icmp"
+    }
+    fn interval(&self) -> Duration {
+        self.host.modules.icmp.interval
+    }
+    async fn observe(&mut self) -> (Self::Observation, bool) {
+        let transition = check_once(
+            &self.host,
+            &self.config,
+            self.backend.as_ref(),
+            &mut self.state,
+        )
+        .await;
+        (
+            (self.state.clone(), transition),
+            self.state.last_error.is_none(),
+        )
+    }
+    async fn persist(
+        &self,
+        observation: &Self::Observation,
+    ) -> Result<(), crate::storage::StorageError> {
+        self.repository
+            .update_check_result(&self.host.id, observation.0.clone(), observation.1.clone())
+            .await
     }
 }
 
@@ -117,7 +148,7 @@ pub async fn check_once(
         timeout: host.modules.icmp.timeout,
     };
 
-    match backend.check(&request).await {
+    match PingCheck(backend).run(&request).await {
         Ok(outcome) => {
             state.latency = Some(outcome.latency);
             state.consecutive_successes = state.consecutive_successes.saturating_add(1);
@@ -196,14 +227,6 @@ fn transition_to(
         backend: backend.into(),
         reason: reason.into(),
     })
-}
-
-async fn jitter(interval: Duration) {
-    let max_millis = (interval.as_millis() / 10).min(2_000) as u64;
-    if max_millis > 0 {
-        let delay = rand::rng().random_range(0..=max_millis);
-        time::sleep(Duration::from_millis(delay)).await;
-    }
 }
 
 #[cfg(test)]
@@ -329,6 +352,7 @@ mod tests {
             Arc::new(storage.clone()),
             repository.clone(),
             Arc::new(Semaphore::new(1)),
+            Arc::new(RuntimeMetrics::default()),
         ));
         time::timeout(Duration::from_secs(2), repository.stored.notified())
             .await
@@ -361,6 +385,7 @@ mod tests {
                 backend,
                 storage.clone(),
                 storage,
+                Arc::new(RuntimeMetrics::default()),
             ),
         )
         .await

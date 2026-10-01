@@ -6,6 +6,8 @@
 # HTTP/1.1 listener. Use a reverse proxy for TLS or HTTP/2.
 bind = "127.0.0.1:3000"
 database_path = "./network-monitor.sqlite3"
+# ICMP and usage change events retain one year of history (bounded maintenance batches).
+history_retention = "365d"
 # Optional. Limits Actix HTTP API worker threads. Omit to use Actix's default,
 # which is based on available CPU parallelism.
 # api_workers = 2
@@ -32,9 +34,9 @@ timeout = "5s"
 ssh_verify_host_key = true
 # Maximum simultaneous usage SSH probes. This is separate from ICMP checks.
 concurrency = 32
-# Per-poll samples are kept for this long. Old samples are pruned inside
-# the same write transaction so the table stays bounded. Change events
-# (usage_history) are not pruned.
+# Per-poll samples retain this window. Each write and periodic maintenance
+# prune old samples, including hosts that have stopped polling. Change events
+# use the global history_retention window, preserving a usage cutoff anchor.
 sample_retention = "30d"
 linux_min_uid = 1000
 macos_min_uid = 500

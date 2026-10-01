@@ -16,8 +16,6 @@ use std::{
 };
 use thiserror::Error;
 
-const MIN_DURATION: Duration = Duration::from_millis(1);
-
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config {path}: {source}")]
@@ -25,11 +23,10 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("failed to parse config {path}: {source}")]
-    Parse {
-        path: PathBuf,
-        source: toml::de::Error,
-    },
+    #[error(
+        "failed to parse config {path}{location}; check TOML syntax, field names, and value types (source omitted to protect secrets)"
+    )]
+    Parse { path: PathBuf, location: String },
     #[error("invalid config: {0}")]
     Invalid(String),
 }
@@ -38,6 +35,7 @@ pub enum ConfigError {
 pub struct AppConfig {
     pub bind: SocketAddr,
     pub database_path: PathBuf,
+    pub history_retention: Duration,
     pub api_workers: Option<usize>,
     pub modules: ModuleConfigs,
     pub api_token: Option<ApiToken>,
@@ -67,6 +65,8 @@ struct RawConfig {
     bind: SocketAddr,
     #[serde(default = "default_database_path")]
     database_path: PathBuf,
+    #[serde(default = "default_history_retention", with = "humantime_serde")]
+    history_retention: Duration,
     #[serde(default)]
     api_workers: Option<usize>,
     #[serde(default)]
@@ -120,6 +120,22 @@ struct ParsedGroupModules {
 }
 
 impl AppConfig {
+    /// Bind, database and worker settings belong to the running process.
+    pub fn for_reload(mut self, running: &Self) -> Result<Self, ConfigError> {
+        if !running.bind.ip().is_loopback()
+            && self.api_token.is_none()
+            && !self.allow_unauthenticated_non_loopback
+        {
+            return Err(ConfigError::Invalid(
+                "reload would remove authentication from the active non-loopback listener".into(),
+            ));
+        }
+        self.bind = running.bind;
+        self.database_path = running.database_path.clone();
+        self.api_workers = running.api_workers;
+        Ok(self)
+    }
+
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -127,9 +143,9 @@ impl AppConfig {
             source,
         })?;
         Self::from_toml_str(&contents).map_err(|err| match err {
-            ConfigError::Parse { source, .. } => ConfigError::Parse {
+            ConfigError::Parse { location, .. } => ConfigError::Parse {
                 path: path.to_path_buf(),
-                source,
+                location,
             },
             other => other,
         })
@@ -138,7 +154,10 @@ impl AppConfig {
     pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(contents).map_err(|source| ConfigError::Parse {
             path: PathBuf::from("<inline>"),
-            source,
+            location: source
+                .span()
+                .map(|span| format!(" at byte {}", span.start))
+                .unwrap_or_default(),
         })?;
         raw.validate()
     }
@@ -161,9 +180,13 @@ impl RawConfig {
     }
 
     fn validate_core_settings(&self) -> Result<(), ConfigError> {
-        if self.api_workers == Some(0) {
+        validate_duration("history_retention", self.history_retention)?;
+        if self
+            .api_workers
+            .is_some_and(|workers| workers == 0 || workers > 256)
+        {
             return Err(ConfigError::Invalid(
-                "api_workers must be at least 1".into(),
+                "api_workers must be between 1 and 256".into(),
             ));
         }
         if self.hosts.is_empty() {
@@ -173,9 +196,6 @@ impl RawConfig {
     }
 
     fn validate_auth_settings(&self) -> Result<(), ConfigError> {
-        if self.api_token.as_ref().is_some_and(ApiToken::is_blank) {
-            return Err(ConfigError::Invalid("api_token must not be empty".into()));
-        }
         if !self.bind.ip().is_loopback()
             && self.api_token.is_none()
             && !self.allow_unauthenticated_non_loopback
@@ -264,12 +284,8 @@ impl RawConfig {
     ) -> Result<AppConfig, ConfigError> {
         let mut hosts = Vec::with_capacity(self.hosts.len());
         for raw in self.hosts {
-            if raw.address.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "host {:?} has an empty address",
-                    raw.id
-                )));
-            }
+            crate::domain::validation::validate_address(&raw.address)
+                .map_err(|message| ConfigError::Invalid(format!("host {:?}: {message}", raw.id)))?;
             let parsed_modules = parse_host_modules(&raw.id, raw.modules)?;
 
             let mut groups = raw.groups;
@@ -321,6 +337,7 @@ impl RawConfig {
         Ok(AppConfig {
             bind: self.bind,
             database_path: self.database_path,
+            history_retention: self.history_retention,
             api_workers: self.api_workers,
             modules,
             api_token: self.api_token,
@@ -405,13 +422,13 @@ where
 {
     value
         .try_into()
-        .map_err(|err| ConfigError::Invalid(format!("{path}: {err}")))
+        .map_err(|_| ConfigError::Invalid(format!("{path}: invalid module field or value type")))
 }
 
 fn validate_module_config(modules: &ModuleConfigs) -> Result<(), ConfigError> {
-    if modules.icmp.concurrency == 0 {
+    if !(1..=4096).contains(&modules.icmp.concurrency) {
         return Err(ConfigError::Invalid(
-            "modules.icmp.concurrency must be at least 1".into(),
+            "modules.icmp.concurrency must be between 1 and 4096".into(),
         ));
     }
     if modules.icmp.failure_threshold == 0 || modules.icmp.success_threshold == 0 {
@@ -423,9 +440,9 @@ fn validate_module_config(modules: &ModuleConfigs) -> Result<(), ConfigError> {
     validate_duration("modules.icmp.interval", modules.icmp.interval)?;
     validate_duration("modules.icmp.timeout", modules.icmp.timeout)?;
 
-    if modules.usage.concurrency == 0 {
+    if !(1..=4096).contains(&modules.usage.concurrency) {
         return Err(ConfigError::Invalid(
-            "modules.usage.concurrency must be at least 1".into(),
+            "modules.usage.concurrency must be between 1 and 4096".into(),
         ));
     }
     validate_duration("modules.usage.interval", modules.usage.interval)?;
@@ -462,14 +479,13 @@ fn validate_host_module_durations(
 }
 
 fn validate_duration(name: &str, duration: Duration) -> Result<(), ConfigError> {
-    if duration < MIN_DURATION {
-        return Err(ConfigError::Invalid(format!("{name} must be at least 1ms")));
-    }
-    Ok(())
+    crate::domain::validation::validate_duration(duration)
+        .map_err(|message| ConfigError::Invalid(format!("{name}: {message}")))
 }
 
 fn validate_id(kind: &str, value: &str) -> Result<(), ConfigError> {
     if value.is_empty()
+        || matches!(value, "." | "..")
         || !value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -506,6 +522,10 @@ fn default_bind() -> SocketAddr {
 
 fn default_database_path() -> PathBuf {
     PathBuf::from("./network-monitor.sqlite3")
+}
+
+fn default_history_retention() -> Duration {
+    Duration::from_secs(365 * 86400)
 }
 
 #[cfg(test)]
@@ -649,7 +669,7 @@ hosts = [{ id = "r1", address = "192.0.2.1", groups = ["core"] }]
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("interval") || err.to_string().contains("unknown"));
+        assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
     #[test]
@@ -664,7 +684,11 @@ enabld = true
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("enabld"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("invalid module field or value type"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -681,7 +705,11 @@ enabld = true
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("enabld"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains("invalid module field or value type"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -760,7 +788,7 @@ hosts = [{ id = "r1", address = "192.0.2.1", groups = ["core"] }]
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("api_token"), "got: {err}");
+        assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
     #[test]
@@ -776,5 +804,43 @@ hosts = [
         .unwrap_err();
 
         assert!(err.to_string().contains("duplicate host id"));
+    }
+    #[rstest::rstest]
+    #[case("0.0.0.0:8080")]
+    #[case("[::]:8080")]
+    fn reload_cannot_remove_auth_from_running_public_listener(#[case] bind: &str) {
+        let running = AppConfig::from_toml_str(&format!("bind = \"{bind}\"\napi_token = \"fake-token\"\nhosts = [{{ id = \"r1\", address = \"192.0.2.1\", groups = [\"example\"] }}]")).unwrap();
+        let next = AppConfig::from_toml_str("bind = \"127.0.0.1:8080\"\nhosts = [{ id = \"r1\", address = \"192.0.2.1\", groups = [\"example\"] }]").unwrap();
+        assert!(next.for_reload(&running).is_err());
+    }
+
+    #[test]
+    fn repeated_reloads_preserve_the_actual_listener() {
+        let running = AppConfig::from_toml_str("bind = \"0.0.0.0:8080\"\napi_token = \"fake-token\"\nhosts = [{ id = \"r1\", address = \"192.0.2.1\", groups = [\"example\"] }]").unwrap();
+        let next = AppConfig::from_toml_str("bind = \"127.0.0.1:8080\"\napi_token = \"fake-new-token\"\nhosts = [{ id = \"r1\", address = \"192.0.2.1\", groups = [\"example\"] }]").unwrap().for_reload(&running).unwrap();
+        assert_eq!(next.bind, running.bind);
+        let removal = AppConfig::from_toml_str(
+            "hosts = [{ id = \"r1\", address = \"192.0.2.1\", groups = [\"example\"] }]",
+        )
+        .unwrap();
+        assert!(removal.for_reload(&next).is_err());
+    }
+
+    #[rstest::rstest]
+    #[case("api_token = [\"fake-sensitive-token\"]\nhosts = []")]
+    #[case("api_token = \"fake-sensitive-token\" invalid\nhosts = []")]
+    #[case(
+        "api_token = \"fake-sensitive-token\"\nhosts = []\n[modules.usage]\ninterval = [\"fake-sensitive-token\"]"
+    )]
+    fn config_diagnostics_never_render_secret_source(#[case] source: &str) {
+        let error = AppConfig::from_toml_str(source).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("fake-sensitive-token"));
+    }
+
+    #[test]
+    fn enormous_durations_are_rejected_without_panicking() {
+        assert!(
+            AppConfig::from_toml_str("hosts = []\nhistory_retention = \"1000000years\"").is_err()
+        );
     }
 }

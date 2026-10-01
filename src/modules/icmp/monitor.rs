@@ -44,10 +44,12 @@ pub async fn run_icmp_monitor(
         });
     }
 
-    while let Some(result) = tasks.join_next().await {
-        if let Err(err) = result {
-            tracing::error!(%err, "icmp monitor task failed");
-        }
+    if let Some(result) = tasks.join_next().await {
+        tracing::error!(
+            ?result,
+            "host monitor exited; stopping module so supervision can restart the service"
+        );
+        tasks.shutdown().await;
     }
 }
 
@@ -60,15 +62,18 @@ async fn monitor_host(
     semaphore: Arc<Semaphore>,
 ) {
     jitter(host.modules.icmp.interval).await;
-    let mut state = match host_repository.host(&host.id).await {
-        Ok(Some(record)) => record.state,
-        Ok(None) => {
-            tracing::warn!(host_id = %host.id, "configured host was not found in repository");
-            HostRuntimeState::default()
-        }
-        Err(err) => {
-            tracing::error!(host_id = %host.id, %err, "failed to load initial host state");
-            HostRuntimeState::default()
+    let mut state = loop {
+        match host_repository.host(&host.id).await {
+            Ok(Some(record)) => break record.state,
+            Err(crate::storage::StorageError::Busy) => time::sleep(Duration::from_millis(25)).await,
+            Ok(None) => {
+                tracing::error!(host_id = %host.id, "configured host is missing");
+                return;
+            }
+            Err(err) => {
+                tracing::error!(host_id = %host.id, %err, "failed to load initial host state");
+                return;
+            }
         }
     };
 
@@ -80,11 +85,20 @@ async fn monitor_host(
             return;
         };
         let transition = check_once(&host, &config, backend.as_ref(), &mut state).await;
-        if let Err(err) = icmp_repository
-            .update_check_result(&host.id, state.clone(), transition)
-            .await
-        {
-            tracing::error!(host_id = %host.id, %err, "failed to store check result");
+        // Do not take another observation until this one is durably recorded.
+        // A retry uses the same state and event identity, preserving transition order.
+        loop {
+            match icmp_repository
+                .update_check_result(&host.id, state.clone(), transition.clone())
+                .await
+            {
+                Ok(()) => break,
+                Err(crate::storage::StorageError::StaleGeneration) => return,
+                Err(err) => {
+                    tracing::error!(host_id = %host.id, %err, "failed to store check result; retrying");
+                    time::sleep(Duration::from_millis(250)).await;
+                }
+            }
         }
     }
 }
@@ -257,5 +271,99 @@ mod tests {
 
         assert_eq!(event.new_status, HostStatus::Down);
         assert_eq!(state.status, HostStatus::Down);
+    }
+    struct FailFirstWrite {
+        storage: crate::storage::SqliteStorage,
+        first: std::sync::atomic::AtomicBool,
+        stored: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl IcmpRepository for FailFirstWrite {
+        async fn update_check_result(
+            &self,
+            id: &str,
+            state: HostRuntimeState,
+            transition: Option<IcmpTransition>,
+        ) -> Result<(), crate::storage::StorageError> {
+            if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::storage::StorageError::InvalidData(
+                    "injected failure".into(),
+                ));
+            }
+            self.storage
+                .update_check_result(id, state, transition)
+                .await?;
+            self.stored.notify_one();
+            Ok(())
+        }
+        async fn history(
+            &self,
+            id: &str,
+            limit: usize,
+        ) -> Result<Vec<IcmpTransition>, crate::storage::StorageError> {
+            self.storage.history(id, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_the_initial_transition_before_taking_another_observation() {
+        let mut fixture = host();
+        fixture.modules.icmp.interval = Duration::from_millis(1);
+        let storage = crate::storage::SqliteStorage::in_memory(vec![fixture.clone()]).unwrap();
+        let repository = Arc::new(FailFirstWrite {
+            storage: storage.clone(),
+            first: std::sync::atomic::AtomicBool::new(true),
+            stored: tokio::sync::Notify::new(),
+        });
+        let backend = Arc::new(FakeBackend {
+            results: Mutex::new(vec![true]),
+        });
+        let task = tokio::spawn(monitor_host(
+            fixture,
+            IcmpMonitorConfig {
+                concurrency: 1,
+                failure_threshold: 1,
+                success_threshold: 1,
+            },
+            backend,
+            Arc::new(storage.clone()),
+            repository.clone(),
+            Arc::new(Semaphore::new(1)),
+        ));
+        time::timeout(Duration::from_secs(2), repository.stored.notified())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        let events = storage.history("r1", 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].new_status, HostStatus::Up);
+    }
+
+    #[tokio::test]
+    async fn a_panicked_host_task_ends_the_module_for_supervision() {
+        let mut fixture = host();
+        fixture.modules.icmp.interval = Duration::from_millis(1);
+        let storage =
+            Arc::new(crate::storage::SqliteStorage::in_memory(vec![fixture.clone()]).unwrap());
+        let backend = Arc::new(FakeBackend {
+            results: Mutex::new(vec![]),
+        });
+        time::timeout(
+            Duration::from_secs(1),
+            run_icmp_monitor(
+                vec![fixture],
+                IcmpMonitorConfig {
+                    concurrency: 1,
+                    failure_threshold: 1,
+                    success_threshold: 1,
+                },
+                backend,
+                storage.clone(),
+                storage,
+            ),
+        )
+        .await
+        .unwrap();
     }
 }

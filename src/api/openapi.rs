@@ -11,6 +11,8 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 #[openapi(
     paths(
         routes::healthz,
+        routes::readyz,
+        routes::hosts_page,
         routes::all_hosts,
         routes::host,
         routes::usage_summary,
@@ -29,6 +31,8 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
         dto::ModuleResponse,
         dto::ConfigOptionResponse,
         dto::HostResponse,
+        dto::HostPageResponse,
+        dto::ReadinessResponse,
         dto::IcmpTransitionResponse,
         dto::UsageHistoryResponse,
         dto::UsageSampleResponse,

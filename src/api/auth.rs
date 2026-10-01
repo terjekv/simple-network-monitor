@@ -45,7 +45,7 @@ mod tests {
             icmp: storage.clone(),
             usage: storage,
             api_token: Arc::new(std::sync::RwLock::new(
-                token.map(crate::domain::ApiToken::from),
+                token.map(|value| crate::domain::ApiToken::new(value).unwrap()),
             )),
             module_config: Arc::new(std::sync::RwLock::new(
                 crate::config::ModuleConfigs::default(),

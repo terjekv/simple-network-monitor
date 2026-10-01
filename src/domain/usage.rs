@@ -48,6 +48,26 @@ pub struct UsageSnapshot {
 }
 
 impl UsageSnapshot {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self.status {
+            UsageCollectionStatus::Ok
+                if self.console_users.is_some()
+                    && self.remote_users.is_some()
+                    && self.error.is_none() =>
+            {
+                Ok(())
+            }
+            UsageCollectionStatus::Failed
+                if self.console_users.is_none()
+                    && self.remote_users.is_none()
+                    && self.error.is_some() =>
+            {
+                Ok(())
+            }
+            _ => Err("usage status and counts are inconsistent"),
+        }
+    }
+
     pub fn success(collected_at: DateTime<Utc>, console_users: u32, remote_users: u32) -> Self {
         Self {
             collected_at,
@@ -103,8 +123,8 @@ pub type UsageHistory = UsageEvent;
 pub struct UsageSummary {
     pub hosts_reporting: usize,
     pub hosts_with_errors: usize,
-    pub console_users: u32,
-    pub remote_users: u32,
+    pub console_users: u64,
+    pub remote_users: u64,
 }
 
 #[derive(Clone, Debug)]

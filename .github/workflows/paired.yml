@@ -1,0 +1,66 @@
+name: Backend and frontend compatibility
+on:
+  workflow_dispatch:
+    inputs:
+      frontend_repository:
+        description: 'Frontend repository (owner/name)'
+        required: true
+        type: string
+      frontend_ref:
+        description: 'Exact frontend commit (40 hex characters)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      frontend_repository:
+        required: true
+        type: string
+      frontend_ref:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  pair:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: backend
+          persist-credentials: false
+      - name: Validate immutable counterpart reference
+        env:
+          FRONTEND_REF: ${{ inputs.frontend_ref }}
+        run: '[[ "$FRONTEND_REF" =~ ^[0-9a-fA-F]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.frontend_repository }}
+          ref: ${{ inputs.frontend_ref }}
+          path: frontend
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Rust and browser prerequisites
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          cd frontend
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Check both projects and browser compatibility
+        run: bash backend/scripts/check-projects.sh "$GITHUB_WORKSPACE/frontend"
+      - name: Record exact checkout pair
+        if: always()
+        run: |
+          git -C backend rev-parse HEAD > pair-revisions.txt
+          git -C frontend rev-parse HEAD >> pair-revisions.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: compatibility-evidence
+          path: |
+            pair-revisions.txt
+            frontend/test-results/

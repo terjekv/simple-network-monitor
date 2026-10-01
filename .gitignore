@@ -14,3 +14,19 @@
 /.env.*
 *.pem
 *.key
+
+# Local operational state, including nested files and SQLite sidecars.
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.crt
+*.cer
+*.p12
+*.pfx
+*.key
+*.pem

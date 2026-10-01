@@ -48,6 +48,9 @@ async fn main() -> std::io::Result<()> {
     storage
         .set_usage_sample_retention(Some(config.modules.usage.sample_retention))
         .map_err(io_other)?;
+    storage
+        .set_history_retention(config.history_retention)
+        .map_err(io_other)?;
     let host_repository: Arc<dyn HostRepository> = storage.clone();
     let icmp_repository: Arc<dyn IcmpRepository> = storage.clone();
     let usage_repository: Arc<dyn UsageRepository> = storage.clone();
@@ -76,9 +79,6 @@ async fn main() -> std::io::Result<()> {
         config.clone(),
         MonitorManagerContext {
             storage: Arc::clone(&storage),
-            host_repository,
-            icmp_repository,
-            usage_repository,
             api_token,
             module_config,
         },
@@ -109,9 +109,6 @@ async fn main() -> std::io::Result<()> {
 
 struct MonitorManagerContext {
     storage: Arc<SqliteStorage>,
-    host_repository: Arc<dyn HostRepository>,
-    icmp_repository: Arc<dyn IcmpRepository>,
-    usage_repository: Arc<dyn UsageRepository>,
     api_token: Arc<RwLock<Option<ApiToken>>>,
     module_config: Arc<RwLock<ModuleConfigs>>,
 }
@@ -128,15 +125,21 @@ async fn run_monitor_manager(
         generation,
         &prepared.config,
         prepared.backend,
-        Arc::clone(&context.host_repository),
-        Arc::clone(&context.icmp_repository),
-        Arc::clone(&context.usage_repository),
+        &context.storage,
         exit_tx.clone(),
-    );
+    )?;
     let mut hup = hup_signal()?;
+    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = maintenance.tick() => {
+                match context.storage.prune_history(chrono::Utc::now()).await {
+                    Ok(rows) => tracing::debug!(rows, "completed history maintenance batch"),
+                    Err(err) => tracing::error!(%err, "history maintenance failed"),
+                }
+            }
             Some(()) = hup.recv() => {
                 match prepare_monitor_config_from_path(&config_path).await {
                     Ok(prepared) => {
@@ -163,6 +166,10 @@ async fn run_monitor_manager(
                             );
                         }
 
+                        let next_config = match next_config.for_reload(&config) {
+                            Ok(next) => next,
+                            Err(err) => { tracing::error!(%err, "unsafe config reload rejected"); continue; }
+                        };
                         apply_reloaded_config(
                             &context.storage,
                             &context.api_token,
@@ -176,11 +183,9 @@ async fn run_monitor_manager(
                             generation,
                             &next_config,
                             prepared.backend,
-                            Arc::clone(&context.host_repository),
-                            Arc::clone(&context.icmp_repository),
-                            Arc::clone(&context.usage_repository),
+                            &context.storage,
                             exit_tx.clone(),
-                        );
+                        )?;
 
                         tracing::info!(
                             hosts = next_config.hosts.len(),
@@ -284,6 +289,9 @@ fn apply_reloaded_config(
     storage
         .set_usage_sample_retention(Some(config.modules.usage.sample_retention))
         .map_err(io_other)?;
+    storage
+        .set_history_retention(config.history_retention)
+        .map_err(io_other)?;
     *token = config.api_token.clone();
     *modules = config.modules.clone();
     Ok(())
@@ -293,19 +301,18 @@ fn spawn_monitor_generation(
     generation: u64,
     config: &AppConfig,
     backend: Option<Arc<dyn PingBackend>>,
-    host_repository: Arc<dyn HostRepository>,
-    icmp_repository: Arc<dyn IcmpRepository>,
-    usage_repository: Arc<dyn UsageRepository>,
+    storage: &SqliteStorage,
     exit_tx: mpsc::UnboundedSender<MonitorExit>,
-) -> MonitorHandles {
+) -> std::io::Result<MonitorHandles> {
+    let repository = Arc::new(storage.monitor_generation().map_err(io_other)?);
     let mut handles = Vec::new();
     for module in modules::registry() {
         let Some(spawned) = module.spawn_monitor(ModuleRuntimeContext {
             config,
             ping_backend: backend.clone(),
-            host_repository: Arc::clone(&host_repository),
-            icmp_repository: Arc::clone(&icmp_repository),
-            usage_repository: Arc::clone(&usage_repository),
+            host_repository: repository.clone(),
+            icmp_repository: repository.clone(),
+            usage_repository: repository.clone(),
         }) else {
             continue;
         };
@@ -314,7 +321,7 @@ fn spawn_monitor_generation(
         handles.push(abort);
     }
 
-    MonitorHandles { handles }
+    Ok(MonitorHandles { handles })
 }
 
 fn watch_monitor_exit(

@@ -489,6 +489,3 @@ jobs:
     name: Check pinned frontend compatibility
     if: vars.SNM_FRONTEND_REF != ''
     uses: ./.github/workflows/paired.yml
-    with:
-      frontend_repository: ${{ vars.SNM_FRONTEND_REPOSITORY || format('{0}/simple-network-monitor-frontend', github.repository_owner) }}
-      frontend_ref: ${{ vars.SNM_FRONTEND_REF }}

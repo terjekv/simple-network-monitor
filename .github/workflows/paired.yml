@@ -1,23 +1,7 @@
 name: Backend and frontend compatibility
 on:
   workflow_dispatch:
-    inputs:
-      frontend_repository:
-        description: 'Frontend repository (owner/name)'
-        required: true
-        type: string
-      frontend_ref:
-        description: 'Exact frontend commit (40 hex characters)'
-        required: true
-        type: string
   workflow_call:
-    inputs:
-      frontend_repository:
-        required: true
-        type: string
-      frontend_ref:
-        required: true
-        type: string
 permissions:
   contents: read
 jobs:
@@ -28,21 +12,22 @@ jobs:
         with:
           path: backend
           persist-credentials: false
-      - name: Validate immutable counterpart reference
+      - name: Validate approved immutable counterpart reference
         env:
-          FRONTEND_REF: ${{ inputs.frontend_ref }}
+          FRONTEND_REF: ${{ vars.SNM_FRONTEND_REF }}
         run: '[[ "$FRONTEND_REF" =~ ^[0-9a-fA-F]{40}$ ]]'
+      # Repository settings select the approved executable counterpart.
+      # Dispatch and reusable-workflow inputs must not choose code to run here.
       - uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.frontend_repository }}
-          ref: ${{ inputs.frontend_ref }}
+          repository: ${{ vars.SNM_FRONTEND_REPOSITORY || format('{0}/simple-network-monitor-frontend', github.repository_owner) }}
+          ref: ${{ vars.SNM_FRONTEND_REF }}
           path: frontend
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          package-manager-cache: false
       - name: Install Rust and browser prerequisites
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt

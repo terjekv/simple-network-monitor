@@ -94,9 +94,10 @@ plugin are development dependencies; production proxy code uses Node built-ins.
 3. Publish the coordinated commits before selecting a remote revision pair.
    Set `SNM_FRONTEND_REF` on the backend and `SNM_BACKEND_REF` on the frontend
    to full commit SHAs; repository names can be overridden with their matching
-   `*_REPOSITORY` variables. The paired workflow also accepts an explicit
-   frontend repository/SHA manually. Require the resulting checks in repository
-   settings. These settings cannot be populated with unpublished working-tree
+   `*_REPOSITORY` variables. Manual backend compatibility runs use the same
+   approved frontend repository/SHA from repository settings; callers cannot
+   override the executable counterpart through workflow inputs. Require the
+   resulting checks in repository settings. These settings cannot be populated with unpublished working-tree
    revisions, and were not changed by this local task.
 
 The paged endpoint returns successive current snapshots, not one multi-request

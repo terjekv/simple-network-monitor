@@ -318,10 +318,13 @@ and desktop/mobile screenshots go to the frontend's ignored `test-results/`.
 latencies and overload responses. These are diagnostic measurements, not
 production capacity guarantees.
 
-The `Backend and frontend compatibility` workflow accepts an explicit frontend
-repository and full commit SHA. To run it on every backend CI event, set the
-repository variable `SNM_FRONTEND_REF` to a tested full SHA, and optionally
-`SNM_FRONTEND_REPOSITORY`. The frontend uses `SNM_BACKEND_REF` and optionally
+The `Backend and frontend compatibility` workflow uses an approved frontend
+repository and full commit SHA from repository settings. To run it on every
+backend CI event, set the repository variable `SNM_FRONTEND_REF` to a tested
+full SHA, and optionally `SNM_FRONTEND_REPOSITORY`. Manual runs use the same
+approved pair; change these variables to select another frontend revision.
+Caller-supplied inputs cannot select executable code, and npm caching is disabled.
+The frontend uses `SNM_BACKEND_REF` and optionally
 `SNM_BACKEND_REPOSITORY` for the reciprocal checks. Set these after publishing
 the coordinated commits; no moving counterpart branch is silently selected.
 Configure the resulting jobs as required checks in repository settings.

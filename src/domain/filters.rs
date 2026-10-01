@@ -77,8 +77,12 @@ impl ActivityPredicate {
         if snapshot.status != UsageCollectionStatus::Ok {
             return false;
         }
-        let console = snapshot.console_users.unwrap_or(0);
-        let remote = snapshot.remote_users.unwrap_or(0);
+        let Some(console) = snapshot.console_users else {
+            return false;
+        };
+        let Some(remote) = snapshot.remote_users else {
+            return false;
+        };
         match self {
             Self::ConsoleOnly => console == 0,
             Self::AnyUser => console == 0 && remote == 0,
@@ -141,9 +145,13 @@ pub fn evaluate_inactivity<H: InactivityHistory>(
     if !predicate.current_state_is_inactive(snapshot) {
         return Ok(false);
     }
-    let cutoff = now
-        - chrono::Duration::from_std(duration)
-            .map_err(|err| InactivityError::InvalidDuration(err.to_string()))?;
+    crate::domain::validation::validate_duration(duration)
+        .map_err(|err| InactivityError::InvalidDuration(err.into()))?;
+    let delta = chrono::Duration::from_std(duration)
+        .map_err(|err| InactivityError::InvalidDuration(err.to_string()))?;
+    let cutoff = now.checked_sub_signed(delta).ok_or_else(|| {
+        InactivityError::InvalidDuration("duration exceeds supported date range".into())
+    })?;
     match history
         .state_at_or_before(cutoff, predicate)
         .map_err(InactivityError::Storage)?
@@ -164,6 +172,17 @@ pub fn evaluate_inactivity<H: InactivityHistory>(
         return Ok(false);
     }
     Ok(true)
+}
+
+impl Default for HostFilter {
+    fn default() -> Self {
+        Self {
+            icmp_status: None,
+            group: None,
+            metadata: HashMap::new(),
+            usage: UsageFilter::empty(Utc::now()),
+        }
+    }
 }
 
 #[cfg(test)]

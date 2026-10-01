@@ -204,7 +204,7 @@ async fn open_applies_wal_and_foreign_keys() {
     let version: i64 = probe
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[tokio::test]
@@ -495,4 +495,225 @@ async fn inactive_console_for_treats_outage_as_unknown() {
         report.hosts.is_empty(),
         "host had a Failed observation in the inactivity window - state was unknown"
     );
+}
+#[tokio::test]
+async fn old_generation_cannot_write_after_replacement() {
+    let storage = SqliteStorage::in_memory(vec![host()]).unwrap();
+    let old = storage.monitor_generation().unwrap();
+    let permit = storage
+        .write_admission
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let queued = tokio::spawn(async move {
+        old.update_check_result(
+            "r1",
+            HostRuntimeState {
+                status: HostStatus::Up,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    let mut replacement = host();
+    replacement.address = "192.0.2.2".into();
+    storage.update_hosts(vec![replacement]).unwrap();
+    drop(permit);
+    assert!(matches!(
+        queued.await.unwrap(),
+        Err(StorageError::StaleGeneration)
+    ));
+    assert_eq!(
+        storage.host("r1").await.unwrap().unwrap().state.status,
+        HostStatus::Unknown
+    );
+}
+
+#[tokio::test]
+async fn address_changes_across_restart_reset_current_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let storage = SqliteStorage::open(&path, vec![host()]).unwrap();
+    storage
+        .update_check_result(
+            "r1",
+            HostRuntimeState {
+                status: HostStatus::Up,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    drop(storage);
+    let mut replacement = host();
+    replacement.address = "192.0.2.2".into();
+    let storage = SqliteStorage::open(&path, vec![replacement]).unwrap();
+    assert_eq!(
+        storage.host("r1").await.unwrap().unwrap().state.status,
+        HostStatus::Unknown
+    );
+}
+
+#[tokio::test]
+async fn saturated_readers_reject_without_spawning_blocking_work() {
+    let storage = SqliteStorage::in_memory(vec![host()]).unwrap();
+    let _all = storage
+        .read_admission
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+    assert!(matches!(storage.host("r1").await, Err(StorageError::Busy)));
+}
+
+#[tokio::test]
+async fn maintenance_prunes_samples_for_removed_hosts() {
+    let storage = SqliteStorage::in_memory(vec![host()]).unwrap();
+    storage
+        .update_usage(
+            "r1",
+            UsageSnapshot::success(Utc::now() - chrono::Duration::days(40), 0, 0),
+        )
+        .await
+        .unwrap();
+    storage
+        .set_usage_sample_retention(Some(Duration::from_secs(30 * 86400)))
+        .unwrap();
+    storage.update_hosts(vec![]).unwrap();
+    assert_eq!(storage.prune_history(Utc::now()).await.unwrap(), 1);
+}
+
+#[rstest::rstest]
+#[case(true, false, false, true)]
+#[case(false, false, false, false)]
+#[case(true, true, false, false)]
+#[case(true, false, true, false)]
+#[tokio::test]
+async fn inactivity_requires_enabled_fresh_continuous_observation(
+    #[case] enabled: bool,
+    #[case] gap: bool,
+    #[case] stale: bool,
+    #[case] expected: bool,
+) {
+    let now = Utc::now();
+    let mut fixture = host();
+    fixture.modules.usage.enabled = enabled;
+    fixture.modules.usage.interval = Duration::from_secs(60);
+    let storage = SqliteStorage::in_memory(vec![fixture]).unwrap();
+    let times = if gap {
+        vec![now - chrono::Duration::minutes(10), now]
+    } else {
+        (0..=10)
+            .rev()
+            .map(|minute| now - chrono::Duration::minutes(minute + if stale { 60 } else { 0 }))
+            .collect()
+    };
+    for time in times {
+        storage
+            .update_usage("r1", UsageSnapshot::success(time, 0, 0))
+            .await
+            .unwrap();
+    }
+    let mut filter = UsageFilter::empty(now);
+    filter.no_users_for = Some(Duration::from_secs(300));
+    assert_eq!(
+        !storage.usage_report(filter).await.unwrap().hosts.is_empty(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn usage_summary_does_not_overflow_u32() {
+    let mut second = host();
+    second.id = "r2".into();
+    let storage = SqliteStorage::in_memory(vec![host(), second]).unwrap();
+    for id in ["r1", "r2"] {
+        storage
+            .update_usage(id, UsageSnapshot::success(Utc::now(), u32::MAX, 0))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        storage
+            .usage_report(UsageFilter::empty(Utc::now()))
+            .await
+            .unwrap()
+            .summary
+            .console_users,
+        u64::from(u32::MAX) * 2
+    );
+}
+
+#[test]
+fn corrupt_latency_returns_error_instead_of_panicking() {
+    assert!(runtime_state_from_row("up".into(), None, None, Some(-1.0), 1, 0, None).is_err());
+}
+
+#[test]
+fn v1_schema_migrates_transactionally() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(
+        conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+            .unwrap(),
+        2
+    );
+    assert!(
+        conn.prepare("SELECT host_id, started_at FROM usage_coverage")
+            .is_ok()
+    );
+    migrate(&conn).unwrap();
+}
+
+#[tokio::test]
+async fn repeating_a_transition_write_does_not_duplicate_history() {
+    let storage = SqliteStorage::in_memory(vec![host()]).unwrap();
+    let event = IcmpTransition {
+        id: None,
+        host_id: "r1".into(),
+        previous_status: HostStatus::Unknown,
+        new_status: HostStatus::Up,
+        changed_at: Utc::now(),
+        latency_ms: Some(1.0),
+        error: None,
+        backend: "fake".into(),
+        reason: "test".into(),
+    };
+    for _ in 0..2 {
+        storage
+            .update_check_result("r1", HostRuntimeState::default(), Some(event.clone()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(storage.history("r1", 10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retention_cannot_make_an_unobserved_long_window_look_inactive() {
+    let now = Utc::now();
+    let mut fixture = host();
+    fixture.modules.usage.enabled = true;
+    fixture.modules.usage.interval = Duration::from_secs(60);
+    let storage = SqliteStorage::in_memory(vec![fixture]).unwrap();
+    for minute in (0..=10).rev() {
+        storage
+            .update_usage(
+                "r1",
+                UsageSnapshot::success(now - chrono::Duration::minutes(minute), 0, 0),
+            )
+            .await
+            .unwrap();
+    }
+    storage
+        .set_history_retention(Duration::from_secs(120))
+        .unwrap();
+    storage.prune_history(now).await.unwrap();
+    let mut filter = UsageFilter::empty(now);
+    filter.no_users_for = Some(Duration::from_secs(300));
+    assert!(storage.usage_report(filter).await.unwrap().hosts.is_empty());
 }

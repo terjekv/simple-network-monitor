@@ -5,16 +5,15 @@ use crate::{
 use async_trait::async_trait;
 use std::{
     collections::HashSet,
-    net::IpAddr,
-    process::Stdio,
+    net::{IpAddr, ToSocketAddrs},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU16, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use thiserror::Error;
-use tokio::{net::lookup_host, process::Command, time};
+use tokio::{process::Command, sync::Semaphore, time};
 
 #[derive(Clone, Debug)]
 pub struct PingCheckRequest {
@@ -96,6 +95,24 @@ impl PingBackend for RawIcmpBackend {
     }
 
     async fn check(&self, request: &PingCheckRequest) -> Result<PingOutcome, CheckFailure> {
+        crate::domain::validation::validate_address(&request.address).map_err(|message| {
+            CheckFailure {
+                message: message.into(),
+            }
+        })?;
+        time::timeout(request.timeout, self.check_resolved(request))
+            .await
+            .map_err(|_| CheckFailure {
+                message: "ICMP probe timed out (including DNS)".into(),
+            })?
+    }
+}
+
+impl RawIcmpBackend {
+    async fn check_resolved(
+        &self,
+        request: &PingCheckRequest,
+    ) -> Result<PingOutcome, CheckFailure> {
         let address = resolve_ip(&request.address).await?;
         let client = match address {
             IpAddr::V4(_) => &self.client_v4,
@@ -161,35 +178,32 @@ impl PingBackend for SystemPingBackend {
     }
 
     async fn check(&self, request: &PingCheckRequest) -> Result<PingOutcome, CheckFailure> {
-        let args = ping_args(self.platform, &request.address, request.timeout);
-        let started = Instant::now();
-        let child = Command::new("ping")
-            .args(args)
-            .kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| CheckFailure {
-                message: format!("failed to start ping: {err}"),
-            })?;
-
-        let output = time::timeout(request.timeout + request.timeout, child.wait_with_output())
+        crate::domain::validation::validate_address(&request.address).map_err(|message| {
+            CheckFailure {
+                message: message.into(),
+            }
+        })?;
+        let mut command = Command::new("ping");
+        command.env("LC_ALL", "C").args(ping_args(
+            self.platform,
+            &request.address,
+            request.timeout,
+        ));
+        let output = crate::backends::process::run(&mut command, b"", request.timeout)
             .await
-            .map_err(|_| CheckFailure {
-                message: "ping command timed out".into(),
-            })?
             .map_err(|err| CheckFailure {
-                message: format!("failed to wait for ping: {err}"),
+                message: format!("ping failed: {err}"),
             })?;
 
         if output.status.success() {
             Ok(PingOutcome {
                 address: request.address.parse::<IpAddr>().ok(),
-                latency: started.elapsed(),
+                latency: parse_latency(&output.stdout).ok_or_else(|| CheckFailure {
+                    message: "ping did not report an RTT".into(),
+                })?,
             })
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = crate::backends::process::error_text(&output.stderr);
             Err(CheckFailure {
                 message: if stderr.is_empty() {
                     format!("ping exited with {}", output.status)
@@ -214,6 +228,7 @@ pub fn ping_args(
             "1".into(),
             "-W".into(),
             format!("{secs:.3}"),
+            "--".into(),
             address.into(),
         ],
         PingPlatform::MacOs => vec![
@@ -222,9 +237,20 @@ pub fn ping_args(
             "1".into(),
             "-W".into(),
             timeout.as_millis().max(1).to_string(),
+            "--".into(),
             address.into(),
         ],
     }
+}
+
+fn parse_latency(output: &[u8]) -> Option<Duration> {
+    let text = std::str::from_utf8(output).ok()?;
+    let sample = text
+        .split("time=")
+        .nth(1)
+        .or_else(|| text.split("time<").nth(1))?;
+    let ms: f64 = sample.split_whitespace().next()?.parse().ok()?;
+    Duration::try_from_secs_f64(ms / 1000.0).ok()
 }
 
 fn current_platform() -> PingPlatform {
@@ -235,15 +261,32 @@ fn current_platform() -> PingPlatform {
     }
 }
 
+// OS resolver calls can outlive a cancelled future. Keep admission inside the
+// blocking task so repeated deadlines cannot accumulate resolver work.
+static DNS_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
+
 async fn resolve_ip(address: &str) -> Result<IpAddr, CheckFailure> {
     if let Ok(ip) = address.parse::<IpAddr>() {
         return Ok(ip);
     }
-    let addrs = lookup_host((address, 0))
-        .await
-        .map_err(|err| CheckFailure {
-            message: format!("failed to resolve address: {err}"),
+    let permit = DNS_ADMISSION
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| CheckFailure {
+            message: "DNS resolver is busy".into(),
         })?;
+    let hostname = address.to_owned();
+    let addrs = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        (hostname.as_str(), 0).to_socket_addrs()
+    })
+    .await
+    .map_err(|err| CheckFailure {
+        message: format!("DNS task failed: {err}"),
+    })?
+    .map_err(|err| CheckFailure {
+        message: format!("failed to resolve address: {err}"),
+    })?;
     // Prefer IPv4 when both families are returned — matches the default behaviour
     // of most ping(8) implementations.
     let mut v4 = None;
@@ -265,7 +308,9 @@ pub(crate) fn next_unique_identifier(
     seed: u16,
 ) -> Result<u16, CheckFailure> {
     const SPACE: u32 = u16::MAX as u32 + 1;
-    let mut set = inflight.lock().expect("inflight mutex poisoned");
+    let mut set = inflight.lock().map_err(|_| CheckFailure {
+        message: "ICMP identifier lock poisoned".into(),
+    })?;
     let mut probe = seed;
     for _ in 0..SPACE {
         if !set.contains(&probe) {
@@ -285,8 +330,8 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case(PingPlatform::Linux, 1_500, vec!["-n", "-c", "1", "-W", "1.500", "192.0.2.1"])]
-    #[case(PingPlatform::MacOs, 1_500, vec!["-n", "-c", "1", "-W", "1500", "192.0.2.1"])]
+    #[case(PingPlatform::Linux, 1_500, vec!["-n", "-c", "1", "-W", "1.500", "--", "192.0.2.1"])]
+    #[case(PingPlatform::MacOs, 1_500, vec!["-n", "-c", "1", "-W", "1500", "--", "192.0.2.1"])]
     fn ping_args_use_platform_timeout_units(
         #[case] platform: PingPlatform,
         #[case] timeout_ms: u64,
@@ -361,5 +406,14 @@ mod tests {
         }
         let set = inflight.lock().unwrap();
         assert_eq!(set.len(), set.iter().collect::<HashSet<_>>().len());
+    }
+    #[tokio::test]
+    async fn saturated_resolver_rejects_without_starting_more_dns_work() {
+        let _all = DNS_ADMISSION.clone().acquire_many_owned(32).await.unwrap();
+        assert_eq!(
+            resolve_ip("router.example").await.unwrap_err().message,
+            "DNS resolver is busy"
+        );
+        assert!(resolve_ip("192.0.2.1").await.is_ok());
     }
 }

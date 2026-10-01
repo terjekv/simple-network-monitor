@@ -54,7 +54,9 @@ mod tests {
             hosts: storage.clone(),
             icmp: storage.clone(),
             usage: storage,
-            api_token: Arc::new(RwLock::new(api_token.map(crate::domain::ApiToken::from))),
+            api_token: Arc::new(RwLock::new(
+                api_token.map(|value| crate::domain::ApiToken::new(value).unwrap()),
+            )),
             module_config: Arc::new(RwLock::new(ModuleConfigs::default())),
         }
     }
@@ -217,6 +219,13 @@ mod tests {
         let body: serde_json::Value = actix_test::read_body_json(resp).await;
         assert!(body["openapi"].as_str().is_some());
         assert!(body["paths"]["/v1/hosts"].is_object());
+        assert!(body["paths"]["/v1/hosts/{id}"].is_object());
+        assert_eq!(
+            body["paths"]["/v1/inventory/hosts"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/HostPageResponse"
+        );
+        assert!(body["paths"].get("/v1/hosts/page").is_none());
         assert!(body["paths"]["/v1/hosts/{id}/usage/samples"].is_object());
         let host_params = body["paths"]["/v1/hosts"]["get"]["parameters"]
             .as_array()
@@ -371,5 +380,109 @@ mod tests {
             .to_request();
         let resp = actix_test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    #[actix_web::test]
+    async fn host_named_page_keeps_its_detail_endpoint() {
+        let config = crate::AppConfig::from_toml_str(
+            r#"hosts = [{ id = "page", address = "192.0.2.1", groups = ["example"] }]"#,
+        )
+        .unwrap();
+        let storage = Arc::new(SqliteStorage::in_memory(config.hosts).unwrap());
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(api_state(storage, Some("fake-token"))))
+                .configure(configure),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/hosts/page")
+            .insert_header(("Authorization", "Bearer fake-token"))
+            .to_request();
+        let response = actix_test::call_service(&app, req).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["id"], "page");
+        assert_eq!(body["address"], "192.0.2.1");
+        assert!(body.get("hosts").is_none());
+    }
+
+    #[actix_web::test]
+    async fn inventory_pages_are_bounded_and_support_conditional_requests() {
+        let mut second = host_fixture();
+        second.id = "r2".into();
+        let storage = Arc::new(SqliteStorage::in_memory(vec![host_fixture(), second]).unwrap());
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(api_state(storage, Some("fake-token"))))
+                .configure(configure),
+        )
+        .await;
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/inventory/hosts?limit=1")
+            .insert_header(("Authorization", "Bearer fake-token"))
+            .to_request();
+        let response = actix_test::call_service(&app, req).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get("etag").unwrap().clone();
+        let body: serde_json::Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["hosts"].as_array().unwrap().len(), 1);
+        assert_eq!(body["next_after"], "r1");
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/inventory/hosts?limit=1")
+            .insert_header(("Authorization", "Bearer fake-token"))
+            .insert_header(("If-None-Match", etag.clone()))
+            .to_request();
+        assert_eq!(
+            actix_test::call_service(&app, req).await.status(),
+            StatusCode::NOT_MODIFIED
+        );
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/inventory/hosts?limit=1")
+            .insert_header(("If-None-Match", etag))
+            .to_request();
+        assert_eq!(
+            actix_test::call_service(&app, req).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/inventory/hosts?after=r1&limit=1")
+            .insert_header(("Authorization", "Bearer fake-token"))
+            .to_request();
+        let body: serde_json::Value = actix_test::call_and_read_body_json(&app, req).await;
+        assert_eq!(body["hosts"][0]["id"], "r2");
+        assert!(body["next_after"].is_null());
+    }
+
+    #[actix_web::test]
+    async fn readiness_requires_current_observations_while_liveness_remains_available() {
+        let storage = Arc::new(SqliteStorage::in_memory(vec![host_fixture()]).unwrap());
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(api_state(storage.clone(), None)))
+                .configure(configure),
+        )
+        .await;
+        let req = actix_test::TestRequest::get().uri("/readyz").to_request();
+        assert_eq!(
+            actix_test::call_service(&app, req).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        storage
+            .update_check_result(
+                "r1",
+                HostRuntimeState {
+                    last_checked_at: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let req = actix_test::TestRequest::get().uri("/readyz").to_request();
+        assert_eq!(
+            actix_test::call_service(&app, req).await.status(),
+            StatusCode::OK
+        );
     }
 }

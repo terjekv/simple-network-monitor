@@ -149,7 +149,10 @@ standalone tarball on non-RPM distributions.
 
 After replacing a config file for a running daemon, send `SIGHUP` to reload it.
 Reload validates the new config before changing shared state; invalid configs are
-logged and ignored. Host lists, groups, metadata, polling settings, backend,
+logged and ignored. If the inventory cannot be persisted (for example, because
+SQLite is busy), the reload is logged and rejected while the current configuration
+and monitors remain active. Send `SIGHUP` again to retry after resolving the error.
+Host lists, groups, metadata, polling settings, backend,
 usage settings, and API token reload. `bind` and `database_path` changes are
 logged but still require a process restart. `api_workers` also requires a
 restart because Actix worker threads are created when the HTTP server starts.
@@ -181,7 +184,7 @@ curl http://127.0.0.1:3000/v1/hosts/router-core-1/usage/samples
 
 Use `[modules.icmp] backend = "system"` for portable macOS/Linux development. `backend = "auto"` tries raw ICMP first and falls back to invoking the system `ping` binary when raw sockets are unavailable. The raw backend is dual-stack: an IPv4 socket is required, an IPv6 socket is opened best-effort (warning logged if the OS denies it).
 
-Usage tracking is disabled by default. `[modules.usage] enabled = true` is the global gate for usage collection; per-host `[hosts.modules.usage] enabled = false` can opt hosts out when the global gate is on. Usernames are not persisted or exposed. Per-poll samples are retained for `modules.usage.sample_retention` (default 30 days) and pruned inside each write transaction; change events (`/usage/history`) are not pruned.
+Usage tracking is disabled by default. `[modules.usage] enabled = true` is the global gate for usage collection; per-host `[hosts.modules.usage] enabled = false` can opt hosts out when the global gate is on. Usernames are not persisted or exposed. Per-poll samples are retained for `modules.usage.sample_retention` (default 30 days). Writes and periodic maintenance prune expired samples, including removed hosts. ICMP and usage change events use `history_retention` (default 365 days); usage retains one observation before the cutoff for inactivity evaluation.
 
 Usage collection autodetects Linux vs macOS by running `uname -s` on the remote
 host. Per-host `os = "linux"` or `os = "macos"` is optional and only skips that
@@ -249,3 +252,82 @@ curl 'http://127.0.0.1:3000/v1/hosts?group=core&metadata.room=net-a'
 
 See [docs/architecture.md](docs/architecture.md) for maintainer notes on
 runtime flow, storage invariants, config validation, and size expectations.
+
+## Freshness, paging, and resource limits
+
+Host responses include `icmp_enabled`, `usage_enabled`, `icmp_stale`, and
+`usage_stale`. An observation is stale if missing, future-dated, or older than
+two resolved collection intervals plus its timeout. Stored status is the last
+known observation; a successful API response does not prove probes are current.
+`/healthz` is unauthenticated process liveness. Authenticated `/readyz` returns
+200 when enabled checks have current observations and 503 while waiting.
+An unreachable host can still have a current failed observation.
+
+`GET /v1/inventory/hosts?limit=500&after=host-id` returns
+`{"hosts": [...], "next_after": "..."}` in host-ID order. `limit` must be
+1..1000; omit `after` for the first page, and stop at a null `next_after`.
+Pages support `ETag` and `If-None-Match`; authentication is still required for
+304 responses. Pages represent successive current reads, not a transaction
+spanning an entire polling cycle. An inventory reload during traversal may
+require another refresh. The existing filtered `/v1/hosts` array API is retained.
+Host details remain at `/v1/hosts/{id}`, including `/v1/hosts/page` for a host
+whose ID is `page`.
+
+Inactivity filters require an enabled collector, a fresh observation, and
+continuous coverage of the requested window. Gaps longer than the freshness
+allowance reset coverage. Retention bounds how far back an affirmative result
+can extend. On the first upgrade from schema version 1, current observations
+are cleared because the old schema did not record host addresses; histories
+are retained. Later address changes, including across restart, reset current
+state and coverage. Back up the SQLite database before upgrading: schema v2
+cannot be opened by a v1 binary.
+
+Configuration durations and inactivity windows must be between 1 ms and 10
+years. API worker counts are 1..256 and probe concurrency is 1..4096. Four
+SQLite reads are admitted concurrently; overload returns 503 so clients can
+back off without growing a blocking-task queue. Subprocess stdout and stderr
+are bounded to 64 KiB each; retained diagnostics are bounded to 4 KiB. Raw-ping
+deadlines include DNS resolution, and system-ping latency is parsed ICMP RTT.
+At most 32 OS DNS lookups run concurrently; their admission slots remain held
+until the resolver exits even if a probe deadline has expired.
+
+Reload validation uses the listener that is actually running. Changing the
+configured bind to loopback cannot remove authentication from a public listener.
+Tokens contain 1..4096 visible ASCII characters. Config parse diagnostics omit
+source snippets to protect secrets. Probe destinations must be IP literals or
+DNS/SSH aliases; configure SSH usernames through the service account's SSH
+configuration. Strict verification explicitly sets `StrictHostKeyChecking=yes`.
+
+## Check the backend and frontend together
+
+With the frontend checkout in `../simple-network-monitor-frontend`, run:
+
+```sh
+cd ../simple-network-monitor-frontend
+npm ci
+npx playwright install chromium
+cd ../simple-network-monitor
+bash scripts/check-projects.sh ../simple-network-monitor-frontend
+```
+
+The shared command validates both trees and runs the actual backend, production
+proxy, and browser with reserved example inventory and probes disabled. Results
+and desktop/mobile screenshots go to the frontend's ignored `test-results/`.
+`SNM_TEST_HOSTS` controls the browser fixture size (at least 100); the default is
+501 so the test crosses an API page boundary. It records 1/10/50-viewer request
+latencies and overload responses. These are diagnostic measurements, not
+production capacity guarantees.
+
+The `Backend and frontend compatibility` workflow uses an approved frontend
+repository and full commit SHA from repository settings. To run it on every
+backend CI event, set the repository variable `SNM_FRONTEND_REF` to a tested
+full SHA, and optionally `SNM_FRONTEND_REPOSITORY`. Manual runs use the same
+approved pair; change these variables to select another frontend revision.
+Caller-supplied inputs cannot select executable code, and npm caching is disabled.
+The frontend uses `SNM_BACKEND_REF` and optionally
+`SNM_BACKEND_REPOSITORY` for the reciprocal checks. Set these after publishing
+the coordinated commits; no moving counterpart branch is silently selected.
+Configure the resulting jobs as required checks in repository settings.
+
+Tagged release reruns compare existing assets byte-for-byte and fail on a
+mismatch. Only the separate `main-latest` publication can replace assets.

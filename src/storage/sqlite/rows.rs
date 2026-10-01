@@ -94,7 +94,12 @@ pub(super) fn runtime_state_from_row(
         status: HostStatus::try_from(status.as_str()).map_err(StorageError::InvalidData)?,
         last_checked_at: parse_optional_ts(last_checked_at)?,
         last_change_at: parse_optional_ts(last_change_at)?,
-        latency: latency_ms.map(|ms| std::time::Duration::from_secs_f64(ms / 1000.0)),
+        latency: latency_ms
+            .map(|ms| {
+                std::time::Duration::try_from_secs_f64(ms / 1000.0)
+                    .map_err(|_| StorageError::InvalidData("invalid latency".into()))
+            })
+            .transpose()?,
         consecutive_successes,
         consecutive_failures,
         last_error,

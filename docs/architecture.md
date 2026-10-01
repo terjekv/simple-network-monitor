@@ -12,7 +12,7 @@ over Actix JSON routes.
 - `backends` implements probing details behind narrow traits.
 - `modules` owns module metadata, config docs, filter docs, enabled-state
   checks, route registration, and monitor spawning for ICMP and usage.
-- `app` owns monitor loops and filter parsing.
+- `app` owns filter parsing and the filter registry. Monitor loops live under `modules`.
 - `storage` owns persistence behind repository traits.
 - `api` owns HTTP routes, DTOs, auth, errors, and OpenAPI annotations.
 
@@ -49,7 +49,7 @@ When adding config fields, update:
 ## Storage
 
 SQLite storage keeps a writer connection behind a mutex. File-backed databases
-also get a small read-only `r2d2_sqlite` pool with `query_only = true`, so read
+also get a small read-only `r2d2` pool with a custom SQLite connection manager with `query_only = true`, so read
 routes can avoid waiting on writer transactions. In-memory storage has no
 reader pool because each SQLite in-memory connection has independent state.
 
@@ -62,6 +62,9 @@ currently have separate purposes:
 - `latest_usage`: latest usage snapshot for each host.
 - `usage_history`: usage change events.
 - `usage_samples`: every retained usage poll sample.
+- `usage_coverage`: start and latest timestamp of continuous collection.
+- `host_identity`: address and usage enabled-state across process restarts.
+- `retention_floor`: oldest trustworthy history boundary after pruning.
 
 The in-memory `usage` map is only a change-detection cache for
 `usage_history`; `latest_usage` is the durable source read by reports.
@@ -90,13 +93,27 @@ When adding a module filter, update:
 Run these before handing off changes:
 
 ```sh
-cargo fmt
-cargo test -p simple-network-monitor
-cargo clippy -p simple-network-monitor --all-targets -- -D warnings
-cargo doc -p simple-network-monitor --no-deps
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+cargo run --locked -- --config monitor.example.toml --verify-config-only
 ```
 
 Keep production files under 1,000 lines. Split large modules by responsibility
 or move large test modules into sibling `tests.rs` files. Keep functions short
 enough to review in one screen; if validation or SQL logic grows, extract a
 named helper that captures one rule or one query path.
+
+Catalogs are immutable `Arc<BTreeMap<...>>` snapshots swapped under an `RwLock`
+on reload. Single-host lookups clone only that host. A semaphore admits readers
+before `spawn_blocking`; another serializes writes. Reader queries use a SQLite
+transaction for a consistent state/usage view. Monitor storage handles carry a
+generation checked under the writer mutex, so queued writes from a replaced
+inventory fail without mutating new state. A host-task exit ends its module and
+is propagated to service supervision. Failed writes retain their observation
+for retry; ICMP transition identity makes repeating a write idempotent.
+
+Periodic maintenance prunes bounded batches independent of active polling.
+Inactivity evaluation is bounded by retained history so a removed event cannot turn a
+long inactivity window into a false affirmative result. Migration is transactional.

@@ -1,8 +1,9 @@
+use crate::backends::process;
 use crate::domain::UsageOs;
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{process::Stdio, time::Duration};
-use tokio::{process::Command, time};
+use std::time::Duration;
+use tokio::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct UsageCollectionRequest {
@@ -42,33 +43,25 @@ impl UsageCollector for SystemSshUsageCollector {
 
     async fn collect(&self, request: &UsageCollectionRequest) -> Result<UsageCounts, UsageFailure> {
         let script = remote_usage_script(request.os, request.linux_min_uid, request.macos_min_uid);
-        let mut command = Command::new("ssh");
-        command
-            .args(ssh_args(
-                &request.address,
-                request.timeout,
-                request.ssh_verify_host_key,
-                &script,
-            ))
-            .kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = command.spawn().map_err(|err| UsageFailure {
-            message: format!("failed to start ssh: {err}"),
+        crate::domain::validation::validate_address(&request.address).map_err(|message| {
+            UsageFailure {
+                message: message.into(),
+            }
         })?;
-
-        let output = time::timeout(request.timeout, child.wait_with_output())
+        let mut command = Command::new("ssh");
+        command.args(ssh_args(
+            &request.address,
+            request.timeout,
+            request.ssh_verify_host_key,
+        ));
+        let output = process::run(&mut command, script.as_bytes(), request.timeout)
             .await
-            .map_err(|_| UsageFailure {
-                message: "ssh collection timed out".into(),
-            })?
             .map_err(|err| UsageFailure {
-                message: format!("failed to wait for ssh: {err}"),
+                message: format!("ssh collection failed: {err}"),
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = process::error_text(&output.stderr);
             return Err(UsageFailure {
                 message: if stderr.is_empty() {
                     format!("ssh exited with {}", output.status)
@@ -84,12 +77,7 @@ impl UsageCollector for SystemSshUsageCollector {
     }
 }
 
-pub fn ssh_args(
-    address: &str,
-    timeout: Duration,
-    verify_host_key: bool,
-    script: &str,
-) -> Vec<String> {
+pub fn ssh_args(address: &str, timeout: Duration, verify_host_key: bool) -> Vec<String> {
     let mut args = vec![
         "-o".into(),
         "BatchMode=yes".into(),
@@ -98,7 +86,9 @@ pub fn ssh_args(
         "-o".into(),
         "NumberOfPasswordPrompts=0".into(),
     ];
-    if !verify_host_key {
+    if verify_host_key {
+        args.extend(["-o".into(), "StrictHostKeyChecking=yes".into()]);
+    } else {
         args.extend([
             "-o".into(),
             "StrictHostKeyChecking=no".into(),
@@ -106,7 +96,7 @@ pub fn ssh_args(
             "UserKnownHostsFile=/dev/null".into(),
         ]);
     }
-    args.extend([address.into(), "sh".into(), "-lc".into(), script.into()]);
+    args.extend(["--".into(), address.into(), "sh".into(), "-s".into()]);
     args
 }
 
@@ -118,10 +108,11 @@ pub fn remote_usage_script(os: UsageOs, linux_min_uid: u32, macos_min_uid: u32) 
         UsageOs::Linux => format!("snm_os=Linux\nmin_uid={linux_min_uid}"),
         UsageOs::Macos => format!("snm_os=Darwin\nmin_uid={macos_min_uid}"),
         UsageOs::Auto => format!(
-            r#"snm_os=$(uname -s 2>/dev/null || echo unknown)
+            r#"snm_os=$(uname -s) || exit 1
 case "$snm_os" in
   Darwin) min_uid={macos_min_uid} ;;
-  *) min_uid={linux_min_uid} ;;
+  Linux) min_uid={linux_min_uid} ;;
+  *) echo "unsupported operating system" >&2; exit 1 ;;
 esac"#
         ),
     };
@@ -132,12 +123,14 @@ remote=0
 seen_console=""
 seen_remote=""
 if [ "$snm_os" = Linux ] && command -v loginctl >/dev/null 2>&1; then
-  for session in $(loginctl list-sessions --no-legend --no-pager 2>/dev/null | awk '{{print $1}}'); do
+  sessions=$(loginctl list-sessions --no-legend --no-pager) || exit 1
+  for session in $(printf '%s\n' "$sessions" | awk '{{print $1}}'); do
     name=""
     uid=""
     session_remote=""
     state=""
     class=""
+    details=$(loginctl show-session "$session" -p Name -p User -p Remote -p State -p Class) || exit 1
     while IFS='=' read -r key value; do
       case "$key" in
         Name) name=$value ;;
@@ -147,10 +140,12 @@ if [ "$snm_os" = Linux ] && command -v loginctl >/dev/null 2>&1; then
         Class) class=$value ;;
       esac
     done <<SNM_LOGINCTL
-$(loginctl show-session "$session" -p Name -p User -p Remote -p State -p Class 2>/dev/null)
+$details
 SNM_LOGINCTL
-    [ -n "$name" ] || continue
-    case "$uid" in *[!0-9]*|"") uid=0 ;; esac
+    [ -n "$name" ] || {{ echo "session identity unavailable" >&2; exit 1; }}
+    case "$uid" in *[!0-9]*|"") echo "invalid user identifier" >&2; exit 1 ;; esac
+    case "$session_remote" in yes|no) ;; *) echo "session remote state unavailable" >&2; exit 1 ;; esac
+    [ -n "$state" ] || {{ echo "session state unavailable" >&2; exit 1; }}
     [ "$uid" -ge "$min_uid" ] || continue
     [ "$state" = closing ] && continue
     [ -z "$class" ] || [ "$class" = user ] || continue
@@ -163,15 +158,14 @@ SNM_LOGINCTL
         ;;
     esac
   done
-  if [ "$console" -gt 0 ] || [ "$remote" -gt 0 ]; then
-    printf '{{"console_users":%s,"remote_users":%s}}\n' "$console" "$remote"
-    exit 0
-  fi
+  printf '{{"console_users":%s,"remote_users":%s}}\n' "$console" "$remote"
+  exit 0
 fi
+observations=$(who) || exit 1
 while read -r user tty rest; do
   [ -n "$user" ] || continue
-  uid=$(id -u "$user" 2>/dev/null || echo 0)
-  case "$uid" in *[!0-9]*|"") uid=0 ;; esac
+  uid=$(id -u "$user") || exit 1
+  case "$uid" in *[!0-9]*|"") echo "invalid user identifier" >&2; exit 1 ;; esac
   [ "$uid" -ge "$min_uid" ] || continue
   case "$tty" in
     console|seat*|tty*|vc/*)
@@ -186,7 +180,7 @@ while read -r user tty rest; do
       ;;
   esac
 done <<SNM_WHO
-$(who)
+$observations
 SNM_WHO
 printf '{{"console_users":%s,"remote_users":%s}}\n' "$console" "$remote"
 "#
@@ -199,7 +193,7 @@ mod tests {
 
     #[test]
     fn ssh_args_use_batch_mode_and_remote_shell() {
-        let args = ssh_args("host.example", Duration::from_secs(5), true, "echo ok");
+        let args = ssh_args("host.example", Duration::from_secs(5), true);
         assert_eq!(args[0], "-o");
         assert!(args.contains(&"BatchMode=yes".into()));
         assert!(!args.contains(&"StrictHostKeyChecking=no".into()));
@@ -209,7 +203,7 @@ mod tests {
 
     #[test]
     fn ssh_args_can_disable_host_key_verification() {
-        let args = ssh_args("host.example", Duration::from_secs(5), false, "echo ok");
+        let args = ssh_args("host.example", Duration::from_secs(5), false);
         assert!(args.contains(&"StrictHostKeyChecking=no".into()));
         assert!(args.contains(&"UserKnownHostsFile=/dev/null".into()));
     }
@@ -248,5 +242,47 @@ mod tests {
         assert!(script.contains("loginctl list-sessions"));
         assert!(script.contains("loginctl show-session"));
         assert!(script.contains("console|seat*|tty*|vc/*"));
+    }
+    #[rstest::rstest]
+    #[case(false, false, 1)]
+    #[case(false, true, 0)]
+    #[case(true, false, 0)]
+    #[tokio::test]
+    async fn executes_script_and_distinguishes_empty_sessions_from_failed_collection(
+        #[case] fail: bool,
+        #[case] empty: bool,
+        #[case] expected_console: u32,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let command = dir.path().join("loginctl");
+        std::fs::write(&command, format!("#!/bin/sh\nif {}; then exit 1; fi\ncase \"$1\" in list-sessions) {} ;; show-session) printf 'Name=fake-user\\nUser=1000\\nRemote=no\\nState=active\\nClass=user\\n' ;; esac\n", if fail {"true"} else {"false"}, if empty {":"} else {"echo '1 fake-user'"})).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut shell = tokio::process::Command::new("sh");
+        shell
+            .arg("-s")
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()));
+        let output = crate::backends::process::run(
+            &mut shell,
+            remote_usage_script(UsageOs::Linux, 1000, 500).as_bytes(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status.success(), !fail);
+        if !fail {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["console_users"], expected_console);
+        }
+    }
+
+    #[test]
+    fn strict_policy_is_explicit_and_script_is_transported_over_stdin() {
+        let args = ssh_args("router.example", Duration::from_secs(2), true);
+        assert!(args.iter().any(|arg| arg == "StrictHostKeyChecking=yes"));
+        assert_eq!(
+            &args[args.len() - 4..],
+            ["--", "router.example", "sh", "-s"]
+        );
     }
 }

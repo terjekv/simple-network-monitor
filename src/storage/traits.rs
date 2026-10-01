@@ -7,6 +7,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("storage is busy; retry shortly")]
+    Busy,
+    #[error("monitor generation has been replaced")]
+    StaleGeneration,
     #[error("host {0:?} not found")]
     NotFound(String),
     #[error("sqlite error: {0}")]
@@ -24,6 +28,20 @@ pub enum StorageError {
 #[async_trait]
 pub trait HostRepository: Send + Sync + 'static {
     async fn hosts(&self, filter: HostFilter) -> Result<Vec<HostRecord>, StorageError>;
+    /// Stable ID ordering; callers request one extra record to detect another page.
+    async fn hosts_page(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<HostRecord>, StorageError> {
+        let mut hosts = self.hosts(HostFilter::default()).await?;
+        hosts.sort_by(|a, b| a.host.id.cmp(&b.host.id));
+        Ok(hosts
+            .into_iter()
+            .filter(|host| after.as_ref().is_none_or(|id| host.host.id > *id))
+            .take(limit)
+            .collect())
+    }
     async fn host(&self, id: &str) -> Result<Option<HostRecord>, StorageError>;
 }
 

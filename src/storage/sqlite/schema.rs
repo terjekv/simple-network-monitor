@@ -1,7 +1,7 @@
 use crate::storage::StorageError;
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub(super) fn migrate(conn: &Connection) -> Result<(), StorageError> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -14,9 +14,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<(), StorageError> {
         return Ok(());
     }
 
-    migrate_icmp(conn)?;
-    migrate_usage(conn)?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    let txn = conn.unchecked_transaction()?;
+    migrate_icmp(&txn)?;
+    migrate_usage(&txn)?;
+    txn.execute_batch("CREATE TABLE IF NOT EXISTS usage_coverage (host_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, observed_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_usage_samples_collected ON usage_samples(collected_at); CREATE INDEX IF NOT EXISTS idx_transitions_changed ON transitions(changed_at); CREATE INDEX IF NOT EXISTS idx_usage_history_collected ON usage_history(collected_at);")?;
+    txn.execute_batch("CREATE TABLE IF NOT EXISTS host_identity (host_id TEXT PRIMARY KEY, address TEXT NOT NULL, usage_enabled INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS retention_floor (id INTEGER PRIMARY KEY CHECK (id = 1), cutoff TEXT NOT NULL);")?;
+    txn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    txn.commit()?;
     Ok(())
 }
 

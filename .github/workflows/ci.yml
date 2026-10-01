@@ -40,6 +40,11 @@ jobs:
       - name: Lint GitHub Actions workflows
         run: go run "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
 
+      - name: Check publication safeguards
+        run: |
+          python3 scripts/test-public-boundary.py
+          python3 scripts/test-publish-tag.py
+
       - name: Install stable Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -453,6 +458,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out publication script
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Download tagged artifacts
         uses: actions/download-artifact@v8
         with:
@@ -473,17 +483,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          elif [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --verify-tag \
-              --generate-notes \
-              --prerelease \
-              --latest=false
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --verify-tag \
-              --generate-notes \
-              --latest
-          fi
+          bash scripts/publish-tag.sh "$GITHUB_REF_NAME" dist
+
+  paired:
+    name: Check pinned frontend compatibility
+    if: vars.SNM_FRONTEND_REF != ''
+    uses: ./.github/workflows/paired.yml

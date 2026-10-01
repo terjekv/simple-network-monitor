@@ -1,6 +1,6 @@
 use crate::{
+    domain::settings::{ResolvedIcmpHostConfig, ResolvedUsageHostConfig},
     domain::{HostStatus, usage::UsageSnapshot},
-    modules::{icmp::ResolvedIcmpHostConfig, usage::ResolvedUsageHostConfig},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -68,4 +68,46 @@ pub struct HostRecord {
 
 pub fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+/// An observation is current for two intervals plus its collection deadline.
+pub fn is_fresh(
+    observed: Option<DateTime<Utc>>,
+    interval: Duration,
+    timeout: Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    observed <= now
+        && (now - observed)
+            .to_std()
+            .is_ok_and(|age| age <= interval.saturating_mul(2).saturating_add(timeout))
+}
+
+impl Host {
+    /// Validate values at persistence and configuration boundaries.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        use super::validation::{validate_address, validate_duration};
+        if self.id.is_empty()
+            || matches!(self.id.as_str(), "." | "..")
+            || !self
+                .id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+        {
+            return Err("invalid host ID");
+        }
+        validate_address(&self.address)?;
+        for duration in [
+            self.modules.icmp.interval,
+            self.modules.icmp.timeout,
+            self.modules.usage.interval,
+            self.modules.usage.timeout,
+        ] {
+            validate_duration(duration)?;
+        }
+        Ok(())
+    }
 }

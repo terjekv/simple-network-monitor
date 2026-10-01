@@ -48,6 +48,9 @@ async fn main() -> std::io::Result<()> {
     storage
         .set_usage_sample_retention(Some(config.modules.usage.sample_retention))
         .map_err(io_other)?;
+    storage
+        .set_history_retention(config.history_retention)
+        .map_err(io_other)?;
     let host_repository: Arc<dyn HostRepository> = storage.clone();
     let icmp_repository: Arc<dyn IcmpRepository> = storage.clone();
     let usage_repository: Arc<dyn UsageRepository> = storage.clone();
@@ -76,9 +79,6 @@ async fn main() -> std::io::Result<()> {
         config.clone(),
         MonitorManagerContext {
             storage: Arc::clone(&storage),
-            host_repository,
-            icmp_repository,
-            usage_repository,
             api_token,
             module_config,
         },
@@ -109,35 +109,47 @@ async fn main() -> std::io::Result<()> {
 
 struct MonitorManagerContext {
     storage: Arc<SqliteStorage>,
-    host_repository: Arc<dyn HostRepository>,
-    icmp_repository: Arc<dyn IcmpRepository>,
-    usage_repository: Arc<dyn UsageRepository>,
     api_token: Arc<RwLock<Option<ApiToken>>>,
     module_config: Arc<RwLock<ModuleConfigs>>,
 }
 
 async fn run_monitor_manager(
     config_path: PathBuf,
-    mut config: AppConfig,
+    config: AppConfig,
     context: MonitorManagerContext,
+) -> std::io::Result<()> {
+    let prepared = prepare_monitor_config(config).await?;
+    manage_monitors(config_path, prepared, context, hup_signal()?).await
+}
+
+async fn manage_monitors(
+    config_path: PathBuf,
+    prepared: PreparedMonitorConfig,
+    context: MonitorManagerContext,
+    mut reload: impl ReloadSignal,
 ) -> std::io::Result<()> {
     let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
     let mut generation = 0_u64;
-    let prepared = prepare_monitor_config(config.clone()).await?;
+    let mut config = prepared.config;
     let mut handles = spawn_monitor_generation(
         generation,
-        &prepared.config,
+        &config,
         prepared.backend,
-        Arc::clone(&context.host_repository),
-        Arc::clone(&context.icmp_repository),
-        Arc::clone(&context.usage_repository),
+        &context.storage,
         exit_tx.clone(),
-    );
-    let mut hup = hup_signal()?;
+    )?;
+    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            Some(()) = hup.recv() => {
+            _ = maintenance.tick() => {
+                match context.storage.prune_history(chrono::Utc::now()).await {
+                    Ok(rows) => tracing::debug!(rows, "completed history maintenance batch"),
+                    Err(err) => tracing::error!(%err, "history maintenance failed"),
+                }
+            }
+            Some(()) = reload.recv() => {
                 match prepare_monitor_config_from_path(&config_path).await {
                     Ok(prepared) => {
                         let next_config = prepared.config;
@@ -163,12 +175,19 @@ async fn run_monitor_manager(
                             );
                         }
 
-                        apply_reloaded_config(
+                        let next_config = match next_config.for_reload(&config) {
+                            Ok(next) => next,
+                            Err(err) => { tracing::error!(%err, "unsafe config reload rejected"); continue; }
+                        };
+                        if let Err(err) = apply_reloaded_config(
                             &context.storage,
                             &context.api_token,
                             &context.module_config,
                             &next_config,
-                        )?;
+                        ) {
+                            tracing::error!(%err, "config reload failed; keeping current config and monitors");
+                            continue;
+                        }
 
                         handles.abort();
                         generation += 1;
@@ -176,11 +195,9 @@ async fn run_monitor_manager(
                             generation,
                             &next_config,
                             prepared.backend,
-                            Arc::clone(&context.host_repository),
-                            Arc::clone(&context.icmp_repository),
-                            Arc::clone(&context.usage_repository),
+                            &context.storage,
                             exit_tx.clone(),
-                        );
+                        )?;
 
                         tracing::info!(
                             hosts = next_config.hosts.len(),
@@ -284,6 +301,9 @@ fn apply_reloaded_config(
     storage
         .set_usage_sample_retention(Some(config.modules.usage.sample_retention))
         .map_err(io_other)?;
+    storage
+        .set_history_retention(config.history_retention)
+        .map_err(io_other)?;
     *token = config.api_token.clone();
     *modules = config.modules.clone();
     Ok(())
@@ -293,19 +313,18 @@ fn spawn_monitor_generation(
     generation: u64,
     config: &AppConfig,
     backend: Option<Arc<dyn PingBackend>>,
-    host_repository: Arc<dyn HostRepository>,
-    icmp_repository: Arc<dyn IcmpRepository>,
-    usage_repository: Arc<dyn UsageRepository>,
+    storage: &SqliteStorage,
     exit_tx: mpsc::UnboundedSender<MonitorExit>,
-) -> MonitorHandles {
+) -> std::io::Result<MonitorHandles> {
+    let repository = Arc::new(storage.monitor_generation().map_err(io_other)?);
     let mut handles = Vec::new();
     for module in modules::registry() {
         let Some(spawned) = module.spawn_monitor(ModuleRuntimeContext {
             config,
             ping_backend: backend.clone(),
-            host_repository: Arc::clone(&host_repository),
-            icmp_repository: Arc::clone(&icmp_repository),
-            usage_repository: Arc::clone(&usage_repository),
+            host_repository: repository.clone(),
+            icmp_repository: repository.clone(),
+            usage_repository: repository.clone(),
         }) else {
             continue;
         };
@@ -314,7 +333,7 @@ fn spawn_monitor_generation(
         handles.push(abort);
     }
 
-    MonitorHandles { handles }
+    Ok(MonitorHandles { handles })
 }
 
 fn watch_monitor_exit(
@@ -338,6 +357,17 @@ fn hup_signal() -> std::io::Result<tokio::signal::unix::Signal> {
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
 }
 
+trait ReloadSignal: Send {
+    fn recv(&mut self) -> impl Future<Output = Option<()>> + Send;
+}
+
+#[cfg(unix)]
+impl ReloadSignal for tokio::signal::unix::Signal {
+    async fn recv(&mut self) -> Option<()> {
+        self.recv().await
+    }
+}
+
 #[cfg(not(unix))]
 fn hup_signal() -> std::io::Result<NeverSignal> {
     Ok(NeverSignal)
@@ -347,7 +377,7 @@ fn hup_signal() -> std::io::Result<NeverSignal> {
 struct NeverSignal;
 
 #[cfg(not(unix))]
-impl NeverSignal {
+impl ReloadSignal for NeverSignal {
     async fn recv(&mut self) -> Option<()> {
         std::future::pending().await
     }
@@ -366,9 +396,49 @@ fn io_other(err: impl std::error::Error + Send + Sync + 'static) -> std::io::Err
 mod tests {
     use super::*;
     use chrono::Utc;
-    use simple_network_monitor::domain::{HostFilter, UsageFilter};
-    use std::{collections::HashMap, io::Write};
+    use simple_network_monitor::{
+        backends::ping::PingCheckRequest,
+        domain::{CheckFailure, HostFilter, HostStatus, PingOutcome, UsageFilter},
+    };
+    use std::{collections::HashMap, io::Write, time::Duration};
     use tempfile::NamedTempFile;
+    use tokio::sync::oneshot;
+
+    struct TestReloadSignal {
+        requests: mpsc::UnboundedReceiver<()>,
+        processed: mpsc::UnboundedSender<()>,
+        received: bool,
+    }
+
+    impl ReloadSignal for TestReloadSignal {
+        async fn recv(&mut self) -> Option<()> {
+            // Re-entering the signal wait proves the previous reload was handled.
+            if self.received {
+                self.processed.send(()).unwrap();
+                self.received = false;
+            }
+            let signal = self.requests.recv().await;
+            self.received = signal.is_some();
+            signal
+        }
+    }
+
+    struct ControlledPing {
+        requests: mpsc::UnboundedSender<oneshot::Sender<PingOutcome>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PingBackend for ControlledPing {
+        fn name(&self) -> &'static str {
+            "controlled"
+        }
+
+        async fn check(&self, _: &PingCheckRequest) -> Result<PingOutcome, CheckFailure> {
+            let (response_tx, response_rx) = oneshot::channel();
+            self.requests.send(response_tx).unwrap();
+            Ok(response_rx.await.unwrap())
+        }
+    }
 
     fn config(contents: &str) -> AppConfig {
         AppConfig::from_toml_str(contents).unwrap()
@@ -486,6 +556,105 @@ backend = "system"
         assert!(err.to_string().contains("at least one host is required"));
         assert_eq!(host_ids(&storage).await, vec!["r1"]);
         assert_eq!(token_value(&api_token).as_deref(), Some("old"));
+    }
+
+    #[tokio::test]
+    async fn busy_reload_keeps_monitors_running_and_allows_retry() {
+        let initial = config(
+            r#"
+api_token = "fake-old-token"
+hosts = [{ id = "r1", address = "192.0.2.1", groups = ["example"] }]
+
+[modules.icmp]
+backend = "system"
+interval = "1ms"
+"#,
+        );
+        let next = write_config(
+            r#"
+api_token = "fake-new-token"
+hosts = [{ id = "r2", address = "192.0.2.2", groups = ["example"] }]
+
+[modules.icmp]
+enabled = false
+"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("state.db");
+        let storage = Arc::new(SqliteStorage::open(&database, initial.hosts.clone()).unwrap());
+        let api_token = Arc::new(RwLock::new(initial.api_token.clone()));
+        let module_config = Arc::new(RwLock::new(initial.modules.clone()));
+        let (probe_tx, mut probe_rx) = mpsc::unbounded_channel();
+        let (reload_tx, reload_rx) = mpsc::unbounded_channel();
+        let (processed_tx, mut processed_rx) = mpsc::unbounded_channel();
+        let mut manager = tokio::spawn(manage_monitors(
+            next.path().to_path_buf(),
+            PreparedMonitorConfig {
+                config: initial,
+                backend: Some(Arc::new(ControlledPing { requests: probe_tx })),
+            },
+            MonitorManagerContext {
+                storage: storage.clone(),
+                api_token: api_token.clone(),
+                module_config: module_config.clone(),
+            },
+            TestReloadSignal {
+                requests: reload_rx,
+                processed: processed_tx,
+                received: false,
+            },
+        ));
+        let probe = tokio::time::timeout(Duration::from_secs(10), probe_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        reload_tx.send(()).unwrap();
+        tokio::select! {
+            result = &mut manager => panic!("manager exited during rejected reload: {result:?}"),
+            processed = tokio::time::timeout(Duration::from_secs(15), processed_rx.recv()) => {
+                assert_eq!(processed.unwrap(), Some(()));
+            }
+        }
+
+        assert_eq!(host_ids(&storage).await, vec!["r1"]);
+        assert_eq!(token_value(&api_token).as_deref(), Some("fake-old-token"));
+        assert!(module_config.read().unwrap().icmp.enabled);
+        assert!(!probe.is_closed(), "the current monitor was aborted");
+
+        writer.execute_batch("ROLLBACK").unwrap();
+        probe
+            .send(PingOutcome {
+                address: Some("192.0.2.1".parse().unwrap()),
+                latency: Duration::from_millis(1),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if storage.host("r1").await.unwrap().unwrap().state.status == HostStatus::Up {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the current monitor must still be able to persist observations");
+
+        reload_tx.send(()).unwrap();
+        tokio::select! {
+            result = &mut manager => panic!("manager exited during reload retry: {result:?}"),
+            processed = tokio::time::timeout(Duration::from_secs(15), processed_rx.recv()) => {
+                assert_eq!(processed.unwrap(), Some(()));
+            }
+        }
+        assert_eq!(host_ids(&storage).await, vec!["r2"]);
+        assert_eq!(token_value(&api_token).as_deref(), Some("fake-new-token"));
+        assert!(!module_config.read().unwrap().icmp.enabled);
+
+        manager.abort();
+        assert!(manager.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

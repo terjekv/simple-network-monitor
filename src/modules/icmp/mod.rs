@@ -44,14 +44,7 @@ pub struct IcmpHostConfig {
     pub timeout: Option<Duration>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ResolvedIcmpHostConfig {
-    pub enabled: bool,
-    #[serde(with = "humantime_serde")]
-    pub interval: Duration,
-    #[serde(with = "humantime_serde")]
-    pub timeout: Duration,
-}
+pub use crate::domain::settings::ResolvedIcmpHostConfig;
 
 impl IcmpModuleConfig {
     pub fn resolve_host(&self, raw: IcmpHostConfig) -> ResolvedIcmpHostConfig {
@@ -74,12 +67,6 @@ impl Default for IcmpModuleConfig {
             failure_threshold: default_failure_threshold(),
             success_threshold: default_success_threshold(),
         }
-    }
-}
-
-impl Default for ResolvedIcmpHostConfig {
-    fn default() -> Self {
-        IcmpModuleConfig::default().resolve_host(IcmpHostConfig::default())
     }
 }
 

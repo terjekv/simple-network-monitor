@@ -22,6 +22,101 @@ struct HistoryQuery {
     limit: Option<usize>,
 }
 
+/// Inventory pages have bounded work and payload size, with conditional responses.
+#[utoipa::path(get, path = "/v1/inventory/hosts",
+    params(("after" = Option<String>, Query, description = "Exclusive host ID cursor"),
+           ("limit" = Option<usize>, Query, description = "Page size, 1..1000; default 500")),
+    responses((status = 200, body = crate::api::dto::HostPageResponse), (status = 304, description = "Unchanged page")))]
+#[get("/v1/inventory/hosts")]
+pub(crate) async fn hosts_page(
+    req: HttpRequest,
+    state: web::Data<ApiState>,
+) -> Result<HttpResponse, ApiError> {
+    use std::hash::{Hash, Hasher};
+    authorize(&req, &state)?;
+    let mut query = parse_unique_query(req.query_string())?;
+    let limit = query
+        .remove("limit")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| ApiError::BadRequest("invalid page limit".into()))
+        })
+        .transpose()?
+        .unwrap_or(500);
+    if !(1..=1000).contains(&limit) {
+        return Err(ApiError::BadRequest("page limit must be 1..1000".into()));
+    }
+    let after = query.remove("after");
+    if !query.is_empty() {
+        return Err(ApiError::BadRequest("unsupported page parameter".into()));
+    }
+    let mut records = state.hosts.hosts_page(after, limit + 1).await?;
+    let more = records.len() > limit;
+    records.truncate(limit);
+    let next_after = if more {
+        records.last().map(|record| record.host.id.clone())
+    } else {
+        None
+    };
+    let page = crate::api::dto::HostPageResponse {
+        hosts: records.into_iter().map(Into::into).collect(),
+        next_after,
+    };
+    let body = serde_json::to_vec(&page)
+        .map_err(|_| ApiError::Internal("page serialization failed".into()))?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hash);
+    let etag = format!("\"{:016x}\"", hash.finish());
+    let unchanged = req
+        .headers()
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag));
+    let mut response = if unchanged {
+        HttpResponse::NotModified()
+    } else {
+        HttpResponse::Ok()
+    };
+    response
+        .insert_header(("ETag", etag))
+        .insert_header(("Cache-Control", "private, no-cache"));
+    Ok(if unchanged {
+        response.finish()
+    } else {
+        response.content_type("application/json").body(body)
+    })
+}
+
+#[utoipa::path(get, path = "/readyz", responses((status = 200, body = crate::api::dto::ReadinessResponse), (status = 503, description = "Waiting for current observations")))]
+#[get("/readyz")]
+pub(crate) async fn readyz(
+    req: HttpRequest,
+    state: web::Data<ApiState>,
+) -> Result<HttpResponse, ApiError> {
+    authorize(&req, &state)?;
+    let records = state.hosts.hosts(Default::default()).await?;
+    let mut enabled_checks = 0;
+    let mut current_checks = 0;
+    for record in records {
+        let dto = HostResponse::from(record);
+        enabled_checks += usize::from(dto.icmp_enabled) + usize::from(dto.usage_enabled);
+        current_checks += usize::from(dto.icmp_enabled && !dto.icmp_stale)
+            + usize::from(dto.usage_enabled && !dto.usage_stale);
+    }
+    let ready = enabled_checks == current_checks;
+    let mut response = if ready {
+        HttpResponse::Ok()
+    } else {
+        HttpResponse::ServiceUnavailable()
+    };
+    Ok(response.json(crate::api::dto::ReadinessResponse {
+        status: if ready { "ready" } else { "waiting" },
+        enabled_checks,
+        current_checks,
+    }))
+}
+
 #[utoipa::path(
     get,
     path = "/healthz",
@@ -292,6 +387,8 @@ pub(crate) async fn host_usage_samples(
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(healthz)
+        .service(readyz)
+        .service(hosts_page)
         .service(namespaces)
         .service(module_catalog)
         .service(all_hosts)

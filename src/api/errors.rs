@@ -29,13 +29,23 @@ impl ResponseError for ApiError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) | Self::Storage(StorageError::NotFound(_)) => StatusCode::NOT_FOUND,
+            Self::Storage(StorageError::Busy) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) | Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     fn error_response(&self) -> HttpResponse {
         HttpResponse::build(self.status_code()).json(ErrorResponse {
-            error: self.to_string(),
+            error: if self.status_code().is_server_error() {
+                if matches!(self, Self::Storage(StorageError::Busy)) {
+                    "service busy; retry shortly".into()
+                } else {
+                    tracing::error!(error = %self, "API request failed");
+                    "internal server error".into()
+                }
+            } else {
+                self.to_string()
+            },
         })
     }
 }

@@ -31,10 +31,12 @@ pub async fn run_usage_monitor(
         });
     }
 
-    while let Some(result) = tasks.join_next().await {
-        if let Err(err) = result {
-            tracing::error!(%err, "usage monitor task failed");
-        }
+    if let Some(result) = tasks.join_next().await {
+        tracing::error!(
+            ?result,
+            "host monitor exited; stopping module so supervision can restart the service"
+        );
+        tasks.shutdown().await;
     }
 }
 
@@ -53,22 +55,27 @@ async fn monitor_usage(
             return;
         };
         let snapshot = collect_once(&host, collector.as_ref()).await;
-        match usage_repository
-            .update_usage(&host.id, snapshot.clone())
-            .await
-        {
-            Ok(changed) => {
-                if changed && snapshot.status == UsageCollectionStatus::Failed {
-                    tracing::warn!(
-                        host_id = %host.id,
-                        collector = collector.name(),
-                        error = %snapshot.error.as_deref().unwrap_or("unknown usage collection error"),
-                        "usage collection failed"
-                    );
+        loop {
+            match usage_repository
+                .update_usage(&host.id, snapshot.clone())
+                .await
+            {
+                Ok(changed) => {
+                    if changed && snapshot.status == UsageCollectionStatus::Failed {
+                        tracing::warn!(
+                            host_id = %host.id,
+                            collector = collector.name(),
+                            error = %snapshot.error.as_deref().unwrap_or("unknown usage collection error"),
+                            "usage collection failed"
+                        );
+                    }
+                    break;
                 }
-            }
-            Err(err) => {
-                tracing::error!(host_id = %host.id, %err, "failed to store usage result");
+                Err(crate::storage::StorageError::StaleGeneration) => return,
+                Err(err) => {
+                    tracing::error!(host_id = %host.id, %err, "failed to store usage result; retrying");
+                    time::sleep(Duration::from_millis(250)).await;
+                }
             }
         }
     }

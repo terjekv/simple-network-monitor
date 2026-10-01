@@ -50,18 +50,7 @@ pub struct UsageHostConfig {
     pub macos_min_uid: Option<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ResolvedUsageHostConfig {
-    pub enabled: bool,
-    pub os: UsageOs,
-    pub ssh_verify_host_key: bool,
-    #[serde(with = "humantime_serde")]
-    pub interval: Duration,
-    #[serde(with = "humantime_serde")]
-    pub timeout: Duration,
-    pub linux_min_uid: u32,
-    pub macos_min_uid: u32,
-}
+pub use crate::domain::settings::ResolvedUsageHostConfig;
 
 impl UsageModuleConfig {
     pub fn resolve_host(
@@ -96,12 +85,6 @@ impl Default for UsageModuleConfig {
             linux_min_uid: default_linux_min_uid(),
             macos_min_uid: default_macos_min_uid(),
         }
-    }
-}
-
-impl Default for ResolvedUsageHostConfig {
-    fn default() -> Self {
-        UsageModuleConfig::default().resolve_host(UsageHostConfig::default(), None)
     }
 }
 

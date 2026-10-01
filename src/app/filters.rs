@@ -365,7 +365,11 @@ fn split_filter_key(key: &str) -> Result<FilterKey<'_>, FilterParseError> {
 }
 
 fn parse_duration_query(name: &str, value: &str) -> Result<Duration, FilterParseError> {
-    humantime::parse_duration(value).map_err(|err| invalid_value(name, value, err))
+    let duration =
+        humantime::parse_duration(value).map_err(|err| invalid_value(name, value, err))?;
+    crate::domain::validation::validate_duration(duration)
+        .map_err(|err| invalid_value(name, value, err))?;
+    Ok(duration)
 }
 
 fn parse_icmp_status(name: &str, value: &str) -> Result<HostStatus, FilterParseError> {

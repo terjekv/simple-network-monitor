@@ -40,11 +40,36 @@ pub struct HostResponse {
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
     pub usage: Option<UsageSnapshotResponse>,
+    pub icmp_enabled: bool,
+    pub usage_enabled: bool,
+    pub icmp_stale: bool,
+    pub usage_stale: bool,
 }
 
 impl From<HostRecord> for HostResponse {
     fn from(record: HostRecord) -> Self {
+        let now = chrono::Utc::now();
+        let icmp_enabled = record.host.modules.icmp.enabled;
+        let usage_enabled = record.host.modules.usage.enabled;
+        let icmp_stale = !icmp_enabled
+            || !crate::domain::host::is_fresh(
+                record.state.last_checked_at,
+                record.host.modules.icmp.interval,
+                record.host.modules.icmp.timeout,
+                now,
+            );
+        let usage_stale = !usage_enabled
+            || !crate::domain::host::is_fresh(
+                record.usage.as_ref().map(|value| value.collected_at),
+                record.host.modules.usage.interval,
+                record.host.modules.usage.timeout,
+                now,
+            );
         Self {
+            icmp_enabled,
+            usage_enabled,
+            icmp_stale,
+            usage_stale,
             id: record.host.id,
             address: record.host.address,
             name: record.host.name,
@@ -155,8 +180,8 @@ pub type UsageSampleResponse = UsageEventResponse;
 pub struct UsageSummaryResponse {
     pub hosts_reporting: usize,
     pub hosts_with_errors: usize,
-    pub console_users: u32,
-    pub remote_users: u32,
+    pub console_users: u64,
+    pub remote_users: u64,
 }
 
 impl From<UsageSummary> for UsageSummaryResponse {
@@ -308,4 +333,17 @@ impl ModuleResponse {
             config_options: config_options.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct HostPageResponse {
+    pub hosts: Vec<HostResponse>,
+    pub next_after: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ReadinessResponse {
+    pub status: &'static str,
+    pub enabled_checks: usize,
+    pub current_checks: usize,
 }

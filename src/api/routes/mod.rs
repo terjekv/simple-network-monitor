@@ -23,11 +23,11 @@ struct HistoryQuery {
 }
 
 /// Inventory pages have bounded work and payload size, with conditional responses.
-#[utoipa::path(get, path = "/v1/hosts/page",
+#[utoipa::path(get, path = "/v1/inventory/hosts",
     params(("after" = Option<String>, Query, description = "Exclusive host ID cursor"),
            ("limit" = Option<usize>, Query, description = "Page size, 1..1000; default 500")),
     responses((status = 200, body = crate::api::dto::HostPageResponse), (status = 304, description = "Unchanged page")))]
-#[get("/v1/hosts/page")]
+#[get("/v1/inventory/hosts")]
 pub(crate) async fn hosts_page(
     req: HttpRequest,
     state: web::Data<ApiState>,

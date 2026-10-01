@@ -149,7 +149,10 @@ standalone tarball on non-RPM distributions.
 
 After replacing a config file for a running daemon, send `SIGHUP` to reload it.
 Reload validates the new config before changing shared state; invalid configs are
-logged and ignored. Host lists, groups, metadata, polling settings, backend,
+logged and ignored. If the inventory cannot be persisted (for example, because
+SQLite is busy), the reload is logged and rejected while the current configuration
+and monitors remain active. Send `SIGHUP` again to retry after resolving the error.
+Host lists, groups, metadata, polling settings, backend,
 usage settings, and API token reload. `bind` and `database_path` changes are
 logged but still require a process restart. `api_workers` also requires a
 restart because Actix worker threads are created when the HTTP server starts.
@@ -260,13 +263,15 @@ known observation; a successful API response does not prove probes are current.
 200 when enabled checks have current observations and 503 while waiting.
 An unreachable host can still have a current failed observation.
 
-`GET /v1/hosts/page?limit=500&after=host-id` returns
+`GET /v1/inventory/hosts?limit=500&after=host-id` returns
 `{"hosts": [...], "next_after": "..."}` in host-ID order. `limit` must be
 1..1000; omit `after` for the first page, and stop at a null `next_after`.
 Pages support `ETag` and `If-None-Match`; authentication is still required for
 304 responses. Pages represent successive current reads, not a transaction
 spanning an entire polling cycle. An inventory reload during traversal may
 require another refresh. The existing filtered `/v1/hosts` array API is retained.
+Host details remain at `/v1/hosts/{id}`, including `/v1/hosts/page` for a host
+whose ID is `page`.
 
 Inactivity filters require an enabled collector, a fresh observation, and
 continuous coverage of the requested window. Gaps longer than the freshness

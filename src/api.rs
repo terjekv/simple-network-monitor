@@ -219,6 +219,13 @@ mod tests {
         let body: serde_json::Value = actix_test::read_body_json(resp).await;
         assert!(body["openapi"].as_str().is_some());
         assert!(body["paths"]["/v1/hosts"].is_object());
+        assert!(body["paths"]["/v1/hosts/{id}"].is_object());
+        assert_eq!(
+            body["paths"]["/v1/inventory/hosts"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/HostPageResponse"
+        );
+        assert!(body["paths"].get("/v1/hosts/page").is_none());
         assert!(body["paths"]["/v1/hosts/{id}/usage/samples"].is_object());
         let host_params = body["paths"]["/v1/hosts"]["get"]["parameters"]
             .as_array()
@@ -375,6 +382,32 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
     #[actix_web::test]
+    async fn host_named_page_keeps_its_detail_endpoint() {
+        let config = crate::AppConfig::from_toml_str(
+            r#"hosts = [{ id = "page", address = "192.0.2.1", groups = ["example"] }]"#,
+        )
+        .unwrap();
+        let storage = Arc::new(SqliteStorage::in_memory(config.hosts).unwrap());
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(api_state(storage, Some("fake-token"))))
+                .configure(configure),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/hosts/page")
+            .insert_header(("Authorization", "Bearer fake-token"))
+            .to_request();
+        let response = actix_test::call_service(&app, req).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["id"], "page");
+        assert_eq!(body["address"], "192.0.2.1");
+        assert!(body.get("hosts").is_none());
+    }
+
+    #[actix_web::test]
     async fn inventory_pages_are_bounded_and_support_conditional_requests() {
         let mut second = host_fixture();
         second.id = "r2".into();
@@ -386,7 +419,7 @@ mod tests {
         )
         .await;
         let req = actix_test::TestRequest::get()
-            .uri("/v1/hosts/page?limit=1")
+            .uri("/v1/inventory/hosts?limit=1")
             .insert_header(("Authorization", "Bearer fake-token"))
             .to_request();
         let response = actix_test::call_service(&app, req).await;
@@ -396,7 +429,7 @@ mod tests {
         assert_eq!(body["hosts"].as_array().unwrap().len(), 1);
         assert_eq!(body["next_after"], "r1");
         let req = actix_test::TestRequest::get()
-            .uri("/v1/hosts/page?limit=1")
+            .uri("/v1/inventory/hosts?limit=1")
             .insert_header(("Authorization", "Bearer fake-token"))
             .insert_header(("If-None-Match", etag.clone()))
             .to_request();
@@ -405,7 +438,7 @@ mod tests {
             StatusCode::NOT_MODIFIED
         );
         let req = actix_test::TestRequest::get()
-            .uri("/v1/hosts/page?limit=1")
+            .uri("/v1/inventory/hosts?limit=1")
             .insert_header(("If-None-Match", etag))
             .to_request();
         assert_eq!(
@@ -413,7 +446,7 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         let req = actix_test::TestRequest::get()
-            .uri("/v1/hosts/page?after=r1&limit=1")
+            .uri("/v1/inventory/hosts?after=r1&limit=1")
             .insert_header(("Authorization", "Bearer fake-token"))
             .to_request();
         let body: serde_json::Value = actix_test::call_and_read_body_json(&app, req).await;

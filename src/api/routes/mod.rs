@@ -259,6 +259,7 @@ pub(crate) async fn module_catalog(
             let enabled = match metadata.id {
                 "icmp" => module_config.icmp.enabled,
                 "usage" => module_config.usage.enabled,
+                "tcp" => module_config.tcp.enabled,
                 _ => false,
             };
             let filters = supported_module_filter_specs(metadata.id, module.filter_specs());

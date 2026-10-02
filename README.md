@@ -228,6 +228,10 @@ changing `api_workers` requires a restart.
 
 Host filters are strict. Dotted filters must use a known namespace and key, except `metadata.<field>` which accepts any metadata field name. Duplicate query keys are rejected with `400`. Metadata filters use exact scalar equality for strings, booleans, and numbers (byte-exact, case-sensitive); arrays and objects are not query-matchable. Use `GET /v1/namespaces` to discover supported filter namespaces and keys, and `GET /v1/modules` for module metadata and config option docs.
 
+The module catalog's `enabled` field reports each module's current global gate,
+including TCP, and reflects successful config reloads. It does not indicate
+whether any hosts have checks configured for that module.
+
 Config files are validated strictly: unknown keys in `[table]` blocks or `[[hosts]]` entries fail at startup with the offending key, so typos like `bakend = "raw"` surface immediately rather than silently using a default.
 
 OpenAPI is generated from Rust endpoint/type annotations with `utoipa`, available at `GET /openapi.json`, and browsable at `/swagger-ui/`.

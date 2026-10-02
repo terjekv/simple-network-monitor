@@ -205,6 +205,72 @@ mod tests {
         }));
     }
 
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[actix_web::test]
+    async fn module_catalog_reports_tcp_enabled_state(#[case] enabled: bool) {
+        let storage = Arc::new(SqliteStorage::in_memory(vec![host_fixture()]).unwrap());
+        let state = api_state(storage, None);
+        state.module_config.write().unwrap().tcp.enabled = enabled;
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/modules")
+            .to_request();
+        let body: serde_json::Value = actix_test::call_and_read_body_json(&app, req).await;
+        let tcp = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["id"] == "tcp")
+            .unwrap();
+        assert_eq!(tcp["enabled"], enabled);
+    }
+
+    #[rstest::rstest]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[actix_web::test]
+    async fn module_catalog_reflects_reloaded_tcp_enabled_state(
+        #[case] initial: bool,
+        #[case] reloaded: bool,
+    ) {
+        let storage = Arc::new(SqliteStorage::in_memory(vec![host_fixture()]).unwrap());
+        let state = api_state(storage, None);
+        let module_config = state.module_config.clone();
+        module_config.write().unwrap().tcp.enabled = initial;
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        for expected in [initial, reloaded] {
+            let req = actix_test::TestRequest::get()
+                .uri("/v1/modules")
+                .to_request();
+            let body: serde_json::Value = actix_test::call_and_read_body_json(&app, req).await;
+            let tcp = body["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|module| module["id"] == "tcp")
+                .unwrap();
+            assert_eq!(tcp["enabled"], expected);
+
+            let mut next = module_config.read().unwrap().clone();
+            next.tcp.enabled = reloaded;
+            *module_config.write().unwrap() = next;
+        }
+    }
+
     #[actix_web::test]
     async fn exposes_openapi_document() {
         let storage = Arc::new(SqliteStorage::in_memory(vec![host_fixture()]).unwrap());

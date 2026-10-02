@@ -43,6 +43,7 @@ macos_min_uid = 500
 
 [modules.tcp]
 # Enable globally to activate the named checks configured on each host.
+# /v1/modules reports this gate, including after a successful config reload.
 enabled = false
 interval = "30s"
 # Includes DNS resolution and all connection attempts.

@@ -10,6 +10,7 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        crate::api::metrics::metrics,
         routes::healthz,
         routes::readyz,
         routes::hosts_page,
@@ -31,6 +32,8 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
         dto::ModuleResponse,
         dto::ConfigOptionResponse,
         dto::HostResponse,
+        dto::TcpCheckResponse,
+        dto::TcpObservationResponse,
         dto::HostPageResponse,
         dto::ReadinessResponse,
         dto::IcmpTransitionResponse,
@@ -38,7 +41,7 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
         dto::UsageSampleResponse,
         dto::UsageReportResponse
     )),
-    tags((name = "simple-network-monitor", description = "ICMP and usage monitoring API"))
+    tags((name = "simple-network-monitor", description = "ICMP, usage, TCP monitoring and metrics API"))
 )]
 struct ApiDoc;
 

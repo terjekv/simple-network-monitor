@@ -3,7 +3,9 @@ use super::*;
 pub(super) fn host_record(conn: &Connection, host: &Host) -> Result<HostRecord, StorageError> {
     let state = load_latest_state(conn, &host.id)?.unwrap_or_default();
     let usage = load_latest_usage(conn, &host.id)?;
-    Ok(state.to_record(host, usage))
+    let mut record = state.to_record(host, usage);
+    record.tcp = super::tcp::load_host(conn, host)?;
+    Ok(record)
 }
 
 pub(super) fn sorted_records(
@@ -13,10 +15,12 @@ pub(super) fn sorted_records(
 ) -> Result<Vec<HostRecord>, StorageError> {
     let mut states = load_all_latest_states(conn)?;
     let usage = load_all_latest_usage(conn)?;
+    let mut tcp = super::tcp::load_all(conn, hosts)?;
     let mut records = Vec::new();
     for host in hosts.values() {
         let state = states.remove(&host.id).unwrap_or_default();
-        let record = state.to_record(host, usage.get(&host.id).cloned());
+        let mut record = state.to_record(host, usage.get(&host.id).cloned());
+        record.tcp = tcp.remove(&host.id).unwrap_or_default();
         if matches_host_filter(conn, &record, filter)? {
             records.push(record);
         }

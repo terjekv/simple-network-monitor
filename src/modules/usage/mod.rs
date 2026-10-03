@@ -1,5 +1,8 @@
 mod monitor;
 
+#[cfg(test)]
+mod tests;
+
 use crate::{
     AppConfig,
     api::routes,
@@ -7,7 +10,8 @@ use crate::{
     backends::usage::{SystemSshUsageCollector, UsageCollector},
     domain::UsageOs,
     modules::{
-        ConfigOptionDoc, ModuleMetadata, ModuleRuntimeContext, MonitorModule, SpawnedMonitor,
+        ConfigOptionDoc, ModuleMetadata, ModuleRuntimeContext, MonitorModule, PreparedMonitor,
+        SpawnedMonitor,
     },
 };
 use actix_web::web;
@@ -90,6 +94,7 @@ impl Default for UsageModuleConfig {
 
 pub struct UsageModule;
 
+#[async_trait::async_trait]
 impl MonitorModule for UsageModule {
     fn metadata(&self) -> ModuleMetadata {
         ModuleMetadata {
@@ -196,25 +201,59 @@ impl MonitorModule for UsageModule {
             .service(routes::host_usage_samples);
     }
 
-    fn spawn_monitor(&self, context: ModuleRuntimeContext<'_>) -> Option<SpawnedMonitor> {
-        if !self.globally_enabled(context.config) || !self.has_enabled_hosts(context.config) {
-            return None;
+    async fn prepare(
+        &self,
+        config: &AppConfig,
+    ) -> std::io::Result<Option<Box<dyn PreparedMonitor>>> {
+        if !self.globally_enabled(config) || !self.has_enabled_hosts(config) {
+            return Ok(None);
         }
+        Ok(Some(Self::prepare_with_collector(
+            config,
+            Arc::new(SystemSshUsageCollector),
+        )))
+    }
+}
 
-        let monitor_config = UsageMonitorConfig {
-            concurrency: context.config.modules.usage.concurrency,
-        };
-        let collector: Arc<dyn UsageCollector> = Arc::new(SystemSshUsageCollector);
-        let handle = tokio::spawn(run_usage_monitor(
-            context.config.hosts.clone(),
-            monitor_config,
+impl UsageModule {
+    /// Prepare with an injected collector, without starting any tasks.
+    pub fn prepare_with_collector(
+        config: &AppConfig,
+        collector: Arc<dyn UsageCollector>,
+    ) -> Box<dyn PreparedMonitor> {
+        Box::new(PreparedUsage {
+            hosts: config
+                .hosts
+                .iter()
+                .filter(|host| host.modules.usage.enabled)
+                .cloned()
+                .collect(),
+            config: UsageMonitorConfig {
+                concurrency: config.modules.usage.concurrency,
+            },
             collector,
-            context.usage_repository,
-        ));
-        Some(SpawnedMonitor {
-            kind: "usage",
-            handle,
         })
+    }
+}
+
+struct PreparedUsage {
+    hosts: Vec<crate::domain::Host>,
+    config: UsageMonitorConfig,
+    collector: Arc<dyn UsageCollector>,
+}
+
+impl PreparedMonitor for PreparedUsage {
+    fn spawn(self: Box<Self>, context: ModuleRuntimeContext) -> SpawnedMonitor {
+        SpawnedMonitor {
+            kind: "usage",
+            handle: tokio::spawn(run_usage_monitor(
+                self.hosts,
+                self.config,
+                self.collector,
+                context.usage_repository,
+                context.metrics,
+            )),
+        }
     }
 }
 

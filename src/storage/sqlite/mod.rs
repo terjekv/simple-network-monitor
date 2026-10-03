@@ -2,6 +2,7 @@ mod maintenance;
 mod queries;
 mod rows;
 mod schema;
+mod tcp;
 use maintenance::*;
 use queries::*;
 

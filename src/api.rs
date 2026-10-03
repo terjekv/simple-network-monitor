@@ -1,6 +1,7 @@
 mod auth;
 mod dto;
 mod errors;
+mod metrics;
 mod openapi;
 pub(crate) mod routes;
 
@@ -16,6 +17,7 @@ pub use errors::ApiError;
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub metrics: Arc<crate::app::telemetry::RuntimeMetrics>,
     pub hosts: Arc<dyn HostRepository>,
     pub icmp: Arc<dyn IcmpRepository>,
     pub usage: Arc<dyn UsageRepository>,
@@ -24,6 +26,7 @@ pub struct ApiState {
 }
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
+    cfg.service(metrics::metrics);
     routes::configure(cfg);
     openapi::configure(cfg);
 }
@@ -51,6 +54,7 @@ mod tests {
 
     fn api_state(storage: Arc<SqliteStorage>, api_token: Option<&str>) -> ApiState {
         ApiState {
+            metrics: Arc::new(crate::app::telemetry::RuntimeMetrics::default()),
             hosts: storage.clone(),
             icmp: storage.clone(),
             usage: storage,
@@ -185,7 +189,7 @@ mod tests {
         let resp = actix_test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = actix_test::read_body_json(resp).await;
-        assert_eq!(body["modules"].as_array().unwrap().len(), 2);
+        assert_eq!(body["modules"].as_array().unwrap().len(), 3);
         assert!(
             body["modules"].as_array().unwrap().iter().any(|module| {
                 module["id"] == "icmp" && module["filters"]["status"].is_object()
@@ -199,6 +203,72 @@ mod tests {
                     .iter()
                     .any(|option| option["key"] == "sample_retention")
         }));
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[actix_web::test]
+    async fn module_catalog_reports_tcp_enabled_state(#[case] enabled: bool) {
+        let storage = Arc::new(SqliteStorage::in_memory(vec![host_fixture()]).unwrap());
+        let state = api_state(storage, None);
+        state.module_config.write().unwrap().tcp.enabled = enabled;
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::get()
+            .uri("/v1/modules")
+            .to_request();
+        let body: serde_json::Value = actix_test::call_and_read_body_json(&app, req).await;
+        let tcp = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["id"] == "tcp")
+            .unwrap();
+        assert_eq!(tcp["enabled"], enabled);
+    }
+
+    #[rstest::rstest]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[actix_web::test]
+    async fn module_catalog_reflects_reloaded_tcp_enabled_state(
+        #[case] initial: bool,
+        #[case] reloaded: bool,
+    ) {
+        let storage = Arc::new(SqliteStorage::in_memory(vec![host_fixture()]).unwrap());
+        let state = api_state(storage, None);
+        let module_config = state.module_config.clone();
+        module_config.write().unwrap().tcp.enabled = initial;
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .configure(configure),
+        )
+        .await;
+
+        for expected in [initial, reloaded] {
+            let req = actix_test::TestRequest::get()
+                .uri("/v1/modules")
+                .to_request();
+            let body: serde_json::Value = actix_test::call_and_read_body_json(&app, req).await;
+            let tcp = body["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|module| module["id"] == "tcp")
+                .unwrap();
+            assert_eq!(tcp["enabled"], expected);
+
+            let mut next = module_config.read().unwrap().clone();
+            next.tcp.enabled = reloaded;
+            *module_config.write().unwrap() = next;
+        }
     }
 
     #[actix_web::test]

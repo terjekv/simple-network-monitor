@@ -149,6 +149,40 @@ package: installation still uses RPM/systemd conventions and declares runtime
 dependencies on `shadow-utils`, `iputils`, and optionally OpenSSH. Use the
 standalone tarball on non-RPM distributions.
 
+## Upgrading from 0.0.2 to 0.0.3
+
+Stop the daemon and back up its SQLite database before the first 0.0.3 start.
+The upgrade migrates the database to schema v3. Upgrades from schema v1 clear
+current observations whose host identity cannot be verified; historical events
+are retained. Upgrades from schema v2 preserve existing ICMP and usage observations.
+Allow enabled collectors to obtain fresh observations after startup.
+To roll back, stop the daemon and restore the pre-upgrade database backup
+before starting 0.0.2. Older binaries cannot open a schema-v3 database.
+
+This release adds independently named TCP port checks and an authenticated
+Prometheus `/metrics` endpoint. TCP remains disabled by default; enable
+`modules.tcp` and configure named checks on each host to opt in. Existing ICMP
+and usage JSON fields retain their meaning; host responses add a `tcp` array.
+See [Prometheus and OpenTelemetry](#prometheus-and-opentelemetry) for the metric
+contract and scrape examples. Dependencies are refreshed, including Utoipa 6
+and Swagger UI 10, and static Linux artifacts use Rust 1.99.0.
+
+Use the coordinated
+[frontend](https://github.com/terjekv/simple-network-monitor-frontend), which
+requests paged inventory at `/v1/inventory/hosts`. The existing `/v1/hosts`
+array endpoint remains available, and `/v1/hosts/page` refers to a host whose
+ID is `page`. The frontend accepts the additional TCP fields while its dashboard
+continues to display ICMP reachability and usage.
+
+If the frontend stores `SNM_API_TOKEN`, configure a distinct
+`SNM_FRONTEND_TOKEN`, or use `SNM_TRUST_AUTH_PROXY=true` behind an authenticated,
+exclusive ingress. Browser-entered tokens stay in memory and must be entered
+again after a page reload. See the
+[remediation record](docs/remediation-2026-09-05.md) for the hardening changes
+and rollout details.
+
+## Runtime configuration and API
+
 After replacing a config file for a running daemon, send `SIGHUP` to reload it.
 Reload validates the new config before changing shared state; invalid configs are
 logged and ignored. If the inventory cannot be persisted (for example, because

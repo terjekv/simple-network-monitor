@@ -46,6 +46,15 @@ pub(super) fn update_coverage(
 /// Reset current observations when a host ID changes meaning, including across restarts.
 pub(super) fn sync_identities(conn: &Connection, hosts: &[Host]) -> Result<(), StorageError> {
     let txn = conn.unchecked_transaction()?;
+    sync_identities_in_transaction(&txn, hosts)?;
+    txn.commit()?;
+    Ok(())
+}
+
+pub(super) fn sync_identities_in_transaction(
+    txn: &Connection,
+    hosts: &[Host],
+) -> Result<(), StorageError> {
     txn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS incoming_hosts (host_id TEXT PRIMARY KEY); DELETE FROM incoming_hosts;")?;
     for host in hosts {
         host.validate()
@@ -83,7 +92,7 @@ pub(super) fn sync_identities(conn: &Connection, hosts: &[Host]) -> Result<(), S
             [],
         )?;
     }
-    super::tcp::sync_checks(&txn, hosts)?;
-    txn.commit()?;
+    super::tcp::sync_checks(txn, hosts)?;
+    super::history::sync_epochs(txn, hosts, Utc::now().timestamp_millis())?;
     Ok(())
 }

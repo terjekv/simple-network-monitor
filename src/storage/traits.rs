@@ -7,6 +7,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("invalid history query: {0}")]
+    InvalidQuery(String),
     #[error("storage is busy; retry shortly")]
     Busy,
     #[error("monitor generation has been replaced")]

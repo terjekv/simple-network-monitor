@@ -31,7 +31,10 @@ impl TcpRepository for SqliteStorage {
         let port = check.port.get();
         let check_id = check_id.as_str().to_owned();
         self.with_inner(move |inner| {
-            inner.conn.execute("INSERT INTO latest_tcp VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(host_id, check_id) DO UPDATE SET address=excluded.address, port=excluded.port, snapshot=excluded.snapshot", params![host.id, check_id, host.address, port, serde_json::to_string(&snapshot)?])?;
+            let txn=inner.conn.transaction()?;
+            history::record(&txn, &host.id, "tcp", &check_id, snapshot.observed_at().timestamp_millis(), crate::domain::history::HistoryObservation { state: if snapshot.success() { "up" } else { "down" }.into(), success: snapshot.success(), latency_ms: snapshot.duration().map(crate::domain::duration_ms), console_users: None, remote_users: None, error: snapshot.error().map(str::to_owned) }, Utc::now().timestamp_millis())?;
+            txn.execute("INSERT INTO latest_tcp VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(host_id, check_id) DO UPDATE SET address=excluded.address, port=excluded.port, snapshot=excluded.snapshot", params![host.id, check_id, host.address, port, serde_json::to_string(&snapshot)?])?;
+            txn.commit()?;
             Ok(())
         }).await
     }

@@ -11,6 +11,10 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 #[openapi(
     paths(
         crate::api::metrics::metrics,
+        crate::api::history::series,
+        crate::api::history::events,
+        crate::api::history::samples,
+        crate::api::history::maintenance,
         routes::healthz,
         routes::readyz,
         routes::hosts_page,
@@ -49,6 +53,7 @@ struct ApiDoc;
 async fn openapi_json() -> HttpResponse {
     let mut doc = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI document serializes");
     inject_filter_params(&mut doc);
+    inject_history_params(&mut doc);
     HttpResponse::Ok().json(doc)
 }
 
@@ -106,4 +111,29 @@ fn query_param(name: &str, spec: FilterKeyMetadata) -> Value {
         "schema": schema,
         "description": spec.description
     })
+}
+
+fn inject_history_params(doc: &mut Value) {
+    let mut parameters = doc["paths"]["/v1/history"]["get"]["parameters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    parameters.retain(|p| p["name"] != "max_points");
+    for parameter in &mut parameters {
+        if parameter["name"] == "from" {
+            parameter["description"] =
+                json!("Inclusive UTC Unix milliseconds; exact event/sample boundary");
+        }
+        if parameter["name"] == "to" {
+            parameter["description"] =
+                json!("Exclusive UTC Unix milliseconds; exact event/sample boundary");
+        }
+    }
+    parameters.extend([
+        json!({"name":"limit","in":"query","required":false,"description":"Maximum records, 1..1000; default 100","schema":{"type":"integer","minimum":1,"maximum":1000,"default":100}}),
+        json!({"name":"before","in":"query","required":false,"description":"Exclusive ingestion-ID cursor returned as next_before; preserve the time window","schema":{"type":"integer","format":"int64","minimum":1}}),
+    ]);
+    for path in ["/v1/history/events", "/v1/history/samples"] {
+        doc["paths"][path]["get"]["parameters"] = json!(parameters);
+    }
 }

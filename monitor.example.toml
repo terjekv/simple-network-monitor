@@ -11,9 +11,28 @@ history_retention = "365d"
 # Optional. Limits Actix HTTP API worker threads. Omit to use Actix's default,
 # which is based on available CPU parallelism.
 # api_workers = 2
-# "auto" tries raw ICMP first (dual-stack: IPv4 + best-effort IPv6) and
-# falls back to invoking the system `ping` binary if raw sockets are not
+# Tiered observations for charts. Retention must increase with bucket width.
+[history]
+raw_retention = "3d"
+five_minute_retention = "30d"
+hourly_retention = "365d"
+daily_retention = "1095d"
+event_retention = "1095d"
+
+# One persistent scheduler handles all database maintenance. No external cron needed.
+[maintenance]
+rollup_interval = "60s"
+retention_interval = "5m"
+reclaim_interval = "1h"
+optimize_interval = "1d"
+batch_size = 500
+# Reclaim only when BOTH thresholds are met; freed pages are reusable meanwhile.
+reclaim_min_bytes = 268435456
+reclaim_free_percent = 20
+reclaim_pages = 1000
+
 [modules.icmp]
+# "auto" tries raw ICMP first and falls back to system ping if raw sockets are not
 # available. "system" forces the binary path, "raw" requires raw sockets.
 backend = "system"
 interval = "30s"

@@ -1,6 +1,7 @@
 mod auth;
 mod dto;
 mod errors;
+mod history;
 mod metrics;
 mod openapi;
 pub(crate) mod routes;
@@ -21,6 +22,7 @@ pub struct ApiState {
     pub hosts: Arc<dyn HostRepository>,
     pub icmp: Arc<dyn IcmpRepository>,
     pub usage: Arc<dyn UsageRepository>,
+    pub history: Arc<crate::storage::SqliteStorage>,
     pub api_token: Arc<RwLock<Option<ApiToken>>>,
     pub module_config: Arc<RwLock<ModuleConfigs>>,
 }
@@ -28,6 +30,7 @@ pub struct ApiState {
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(metrics::metrics);
     routes::configure(cfg);
+    history::configure(cfg);
     openapi::configure(cfg);
 }
 
@@ -57,6 +60,7 @@ mod tests {
             metrics: Arc::new(crate::app::telemetry::RuntimeMetrics::default()),
             hosts: storage.clone(),
             icmp: storage.clone(),
+            history: storage.clone(),
             usage: storage,
             api_token: Arc::new(RwLock::new(
                 api_token.map(|value| crate::domain::ApiToken::new(value).unwrap()),

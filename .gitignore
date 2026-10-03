@@ -30,3 +30,6 @@
 *.pfx
 *.key
 *.pem
+
+# Database ownership locks
+*.snm-lock

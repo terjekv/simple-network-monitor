@@ -37,6 +37,8 @@ pub struct AppConfig {
     pub bind: SocketAddr,
     pub database_path: PathBuf,
     pub history_retention: Duration,
+    pub history: crate::domain::maintenance::HistoryConfig,
+    pub maintenance: crate::domain::maintenance::MaintenanceConfig,
     pub api_workers: Option<usize>,
     pub modules: ModuleConfigs,
     pub api_token: Option<ApiToken>,
@@ -69,6 +71,10 @@ struct RawConfig {
     database_path: PathBuf,
     #[serde(default = "default_history_retention", with = "humantime_serde")]
     history_retention: Duration,
+    #[serde(default)]
+    history: crate::domain::maintenance::HistoryConfig,
+    #[serde(default)]
+    maintenance: crate::domain::maintenance::MaintenanceConfig,
     #[serde(default)]
     api_workers: Option<usize>,
     #[serde(default)]
@@ -184,6 +190,12 @@ impl RawConfig {
 
     fn validate_core_settings(&self) -> Result<(), ConfigError> {
         validate_duration("history_retention", self.history_retention)?;
+        self.history
+            .validate()
+            .map_err(|e| ConfigError::Invalid(e.into()))?;
+        self.maintenance
+            .validate()
+            .map_err(|e| ConfigError::Invalid(e.into()))?;
         if self
             .api_workers
             .is_some_and(|workers| workers == 0 || workers > 256)
@@ -350,6 +362,8 @@ impl RawConfig {
             bind: self.bind,
             database_path: self.database_path,
             history_retention: self.history_retention,
+            history: self.history,
+            maintenance: self.maintenance,
             api_workers: self.api_workers,
             modules,
             api_token: self.api_token,

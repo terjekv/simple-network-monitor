@@ -24,6 +24,9 @@ struct Cli {
     /// Validate the config file and exit without starting monitors or the API.
     #[arg(long = "verify-config-only", alias = "verify-config")]
     verify_config_only: bool,
+    /// Compact an existing database offline and enable incremental space reclamation.
+    #[arg(long, conflicts_with = "verify_config_only")]
+    compact_database: bool,
 }
 
 #[actix_web::main]
@@ -42,6 +45,11 @@ async fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    if cli.compact_database {
+        SqliteStorage::compact_database(&config.database_path).map_err(io_other)?;
+        println!("database compacted; incremental reclamation enabled");
+        return Ok(());
+    }
     let prepared = prepare_monitor_config(config.clone()).await?;
     let storage = Arc::new(
         SqliteStorage::open(&config.database_path, config.hosts.clone()).map_err(io_other)?,
@@ -51,6 +59,9 @@ async fn main() -> std::io::Result<()> {
         .map_err(io_other)?;
     storage
         .set_history_retention(config.history_retention)
+        .map_err(io_other)?;
+    storage
+        .configure_maintenance(config.history.clone(), config.maintenance.clone())
         .map_err(io_other)?;
     let host_repository: Arc<dyn HostRepository> = storage.clone();
     let icmp_repository: Arc<dyn IcmpRepository> = storage.clone();
@@ -63,6 +74,7 @@ async fn main() -> std::io::Result<()> {
         hosts: Arc::clone(&host_repository),
         icmp: Arc::clone(&icmp_repository),
         usage: Arc::clone(&usage_repository),
+        history: storage.clone(),
         api_token: Arc::clone(&api_token),
         module_config: Arc::clone(&module_config),
     };
@@ -88,6 +100,12 @@ async fn main() -> std::io::Result<()> {
         },
     ));
 
+    let (maintenance_stop, maintenance_shutdown) = tokio::sync::watch::channel(false);
+    let mut maintenance = tokio::spawn(simple_network_monitor::app::maintenance::run(
+        storage.clone(),
+        maintenance_shutdown,
+    ));
+
     let server = {
         let mut server = HttpServer::new(move || {
             App::new()
@@ -102,13 +120,20 @@ async fn main() -> std::io::Result<()> {
     .bind(config.bind)?
     .run();
 
-    tokio::select! {
+    let result = tokio::select! {
+        result = &mut maintenance => {
+            tracing::error!(?result, "maintenance scheduler exited; shutting down");
+            return Err(std::io::Error::other("maintenance scheduler exited"));
+        }
         result = server => result,
         result = monitor_manager => {
             tracing::error!(?result, "monitor manager exited; shutting down");
             Err(std::io::Error::other("monitor manager exited"))
         }
-    }
+    };
+    let _ = maintenance_stop.send(true);
+    let _ = maintenance.await;
+    result
 }
 
 struct MonitorManagerContext {
@@ -142,17 +167,8 @@ async fn manage_monitors(
         context.metrics.clone(),
         exit_tx.clone(),
     )?;
-    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
-    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     loop {
         tokio::select! {
-            _ = maintenance.tick() => {
-                match context.storage.prune_history(chrono::Utc::now()).await {
-                    Ok(rows) => tracing::debug!(rows, "completed history maintenance batch"),
-                    Err(err) => tracing::error!(%err, "history maintenance failed"),
-                }
-            }
             Some(()) = reload.recv() => {
                 match prepare_monitor_config_from_path(&config_path).await {
                     Ok(prepared) => {
@@ -299,13 +315,13 @@ fn apply_reloaded_config(
         .write()
         .map_err(|_| std::io::Error::other("module config lock poisoned"))?;
     storage
-        .update_hosts(config.hosts.clone())
-        .map_err(io_other)?;
-    storage
-        .set_usage_sample_retention(Some(config.modules.usage.sample_retention))
-        .map_err(io_other)?;
-    storage
-        .set_history_retention(config.history_retention)
+        .update_configuration(
+            config.hosts.clone(),
+            config.history.clone(),
+            config.maintenance.clone(),
+            config.modules.usage.sample_retention,
+            config.history_retention,
+        )
         .map_err(io_other)?;
     *token = config.api_token.clone();
     *modules = config.modules.clone();

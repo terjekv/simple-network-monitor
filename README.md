@@ -149,6 +149,36 @@ package: installation still uses RPM/systemd conventions and declares runtime
 dependencies on `shadow-utils`, `iputils`, and optionally OpenSSH. Use the
 standalone tarball on non-RPM distributions.
 
+## Upgrading from 0.0.3 to 0.0.4
+
+Stop the daemon and take a consistent SQLite backup before the first 0.0.4 start.
+The upgrade migrates the database to schema v4 and preserves existing current
+observations and legacy ICMP/usage history. New chart history starts with observations
+collected after the upgrade; historical latency and coverage cannot be reconstructed
+from the old latest-state records. Rollback requires restoring the pre-upgrade backup
+before starting an older binary.
+
+The coordinated frontend adds combined, per-group, and per-host charts for ICMP/TCP
+availability, latency, and usage, plus a read-only maintenance view. Deploy it with
+this backend; its history endpoints are unavailable on 0.0.3. Existing inventory and
+legacy history API contracts remain supported. Keep the frontend's existing visitor
+authentication boundary when it holds a server-side backend token.
+
+The daemon now schedules rollups, retention, incremental space reclamation, passive
+WAL checkpoints, optimization, and maintenance-log cleanup. New databases enable
+incremental vacuum automatically. For an existing database, stop every writer and run
+`simple-network-monitor --config monitor.toml --compact-database` once, using the
+service account, config path, and working directory. Full compaction is explicit
+and may need temporary free disk space around twice the database size; normal
+startup never runs it. Keep the `.snm-lock` file in place while the daemon runs.
+
+Review `[history]` and `[maintenance]` in `monitor.example.toml` and the
+[history and maintenance guide](docs/history-maintenance.md) for retention defaults,
+coverage semantics, bounded query limits, and scheduler operation. Retention is
+time-based rather than a hard disk quota. Configuration reload commits host identities,
+maintenance schedules, and retention policies together; a failed update leaves the
+previous monitoring generation active.
+
 ## Upgrading from 0.0.2 to 0.0.3
 
 Stop the daemon and back up its SQLite database before the first 0.0.3 start.
@@ -510,3 +540,17 @@ reload is committed, and the shared runner handles timing, concurrency,
 persistence retries, execution metrics, and task supervision. See
 [Writing Monitor Modules](docs/modules.md) for the extension workflow and
 invariants. Extensions are compiled into the binary.
+
+## Historical charts and database maintenance
+
+The paired frontend includes combined fleet and group history, host detail graphs,
+a paginated observed-change feed, and a read-only database maintenance view.
+SQLite stores raw observations briefly and retains mergeable 5-minute, hourly,
+and daily summaries for progressively longer windows. Unknown monitoring time
+remains distinct from downtime and zero usage.
+
+A supervised Tokio scheduler performs durable rollups, bounded retention cleanup,
+threshold-based incremental space reclamation, passive WAL checkpoints, query
+optimization, and maintenance-log cleanup. No external scheduler or additional
+runtime service is required. See [History and maintenance](docs/history-maintenance.md)
+for API semantics, retention defaults, operational setup, and extension guidance.

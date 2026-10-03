@@ -27,7 +27,9 @@ impl ResponseError for ApiError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::BadRequest(_) | Self::Storage(StorageError::InvalidQuery(_)) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::NotFound(_) | Self::Storage(StorageError::NotFound(_)) => StatusCode::NOT_FOUND,
             Self::Storage(StorageError::Busy) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) | Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,

@@ -44,6 +44,7 @@ mod tests {
             metrics: Arc::new(crate::app::telemetry::RuntimeMetrics::default()),
             hosts: storage.clone(),
             icmp: storage.clone(),
+            history: storage.clone(),
             usage: storage,
             api_token: Arc::new(std::sync::RwLock::new(
                 token.map(|value| crate::domain::ApiToken::new(value).unwrap()),

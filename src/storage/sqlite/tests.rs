@@ -204,7 +204,7 @@ async fn open_applies_wal_and_foreign_keys() {
     let version: i64 = probe
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[tokio::test]
@@ -661,7 +661,7 @@ fn v1_schema_migrates_transactionally() {
     assert_eq!(
         conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
             .unwrap(),
-        3
+        4
     );
     assert!(
         conn.prepare("SELECT host_id, started_at FROM usage_coverage")

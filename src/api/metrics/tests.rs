@@ -25,6 +25,7 @@ fn state(storage: Arc<SqliteStorage>) -> ApiState {
     ApiState {
         hosts: storage.clone(),
         icmp: storage.clone(),
+        history: storage.clone(),
         usage: storage,
         metrics: Arc::new(RuntimeMetrics::default()),
         api_token: Arc::new(RwLock::new(Some(

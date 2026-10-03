@@ -281,7 +281,7 @@ fn history_limit(query: &HistoryQuery) -> usize {
         .clamp(1, HISTORY_LIMIT_MAX)
 }
 
-fn parse_unique_query(query: &str) -> Result<HashMap<String, String>, ApiError> {
+pub(super) fn parse_unique_query(query: &str) -> Result<HashMap<String, String>, ApiError> {
     let pairs: Vec<(String, String)> = serde_urlencoded::from_str(query)
         .map_err(|err| ApiError::BadRequest(format!("invalid query string: {err}")))?;
     let mut seen = HashSet::new();

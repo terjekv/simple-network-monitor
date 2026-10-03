@@ -1,3 +1,5 @@
+mod history;
+mod jobs;
 mod maintenance;
 mod queries;
 mod rows;
@@ -29,9 +31,18 @@ use std::{
     time::Duration,
 };
 
+struct StoragePolicies {
+    history: crate::domain::maintenance::HistoryConfig,
+    maintenance: crate::domain::maintenance::MaintenanceConfig,
+    usage_retention: Duration,
+    history_retention: Duration,
+}
+
 struct Inner {
     generation: u64,
     history_retention: Duration,
+    history_config: crate::domain::maintenance::HistoryConfig,
+    maintenance_config: crate::domain::maintenance::MaintenanceConfig,
     usage: HashMap<String, UsageSnapshot>,
     conn: Connection,
     /// When set, `update_usage` deletes any usage_samples row older than
@@ -90,9 +101,13 @@ pub struct SqliteStorage {
     read_admission: Arc<tokio::sync::Semaphore>,
     write_admission: Arc<tokio::sync::Semaphore>,
     write_generation: Option<u64>,
+    maintenance_admission: Arc<tokio::sync::Semaphore>,
+    history_policy: Arc<RwLock<crate::domain::maintenance::HistoryConfig>>,
     inner: Arc<Mutex<Inner>>,
     /// `Some` for file-backed storage; `None` for in-memory.
     readers: Option<ReaderPool>,
+    database_path: Option<std::path::PathBuf>,
+    _database_lock: Option<Arc<std::fs::File>>,
 }
 
 impl SqliteStorage {
@@ -103,20 +118,32 @@ impl SqliteStorage {
 
     pub fn open(path: impl AsRef<Path>, hosts: Vec<Host>) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
+        let lock = database_lock(&path)?;
         let writer = Connection::open(&path)?;
+        let tables: i64 = writer.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+            [],
+            |r| r.get(0),
+        )?;
+        if tables == 0 {
+            writer.execute_batch("PRAGMA auto_vacuum=INCREMENTAL")?;
+        }
         apply_pragmas(&writer)?;
         migrate(&writer)?;
 
         // Reader connections are opened read-only and additionally set to
         // query_only so future read helpers cannot accidentally mutate SQLite.
-        let manager = ReadOnlySqliteConnectionManager::new(path);
+        let manager = ReadOnlySqliteConnectionManager::new(path.clone());
         let readers = r2d2::Pool::builder()
             .max_size(Self::READER_POOL_SIZE)
             .build(manager)
             .map_err(|err| {
                 StorageError::InvalidData(format!("failed to build reader pool: {err}"))
             })?;
-        Self::new_initialized(writer, hosts, Some(readers))
+        let mut storage = Self::new_initialized(writer, hosts, Some(readers))?;
+        storage.database_path = Some(path);
+        storage._database_lock = Some(Arc::new(lock));
+        Ok(storage)
     }
 
     pub fn in_memory(hosts: Vec<Host>) -> Result<Self, StorageError> {
@@ -148,14 +175,20 @@ impl SqliteStorage {
             read_admission: Arc::new(tokio::sync::Semaphore::new(Self::READER_POOL_SIZE as usize)),
             write_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             write_generation: None,
+            maintenance_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            history_policy: Arc::new(RwLock::new(Default::default())),
             inner: Arc::new(Mutex::new(Inner {
                 generation: 0,
+                history_config: Default::default(),
+                maintenance_config: Default::default(),
                 history_retention: Duration::from_secs(365 * 86400),
                 usage,
                 conn,
                 usage_sample_retention: None,
             })),
             readers,
+            database_path: None,
+            _database_lock: None,
         })
     }
 
@@ -199,6 +232,44 @@ impl SqliteStorage {
     }
 
     pub fn update_hosts(&self, hosts: Vec<Host>) -> Result<(), StorageError> {
+        self.replace_configuration(hosts, None)
+    }
+
+    /// Publish identities, maintenance schedules, policies, and writer generation atomically.
+    pub fn update_configuration(
+        &self,
+        hosts: Vec<Host>,
+        history: crate::domain::maintenance::HistoryConfig,
+        maintenance: crate::domain::maintenance::MaintenanceConfig,
+        usage_retention: Duration,
+        history_retention: Duration,
+    ) -> Result<(), StorageError> {
+        history
+            .validate()
+            .map_err(|e| StorageError::InvalidData(e.into()))?;
+        maintenance
+            .validate()
+            .map_err(|e| StorageError::InvalidData(e.into()))?;
+        for duration in [usage_retention, history_retention] {
+            crate::domain::validation::validate_duration(duration)
+                .map_err(|e| StorageError::InvalidData(e.into()))?;
+        }
+        self.replace_configuration(
+            hosts,
+            Some(StoragePolicies {
+                history,
+                maintenance,
+                usage_retention,
+                history_retention,
+            }),
+        )
+    }
+
+    fn replace_configuration(
+        &self,
+        hosts: Vec<Host>,
+        policies: Option<StoragePolicies>,
+    ) -> Result<(), StorageError> {
         let host_ids = hosts
             .iter()
             .map(|host| host.id.clone())
@@ -213,7 +284,23 @@ impl SqliteStorage {
 
         let mut current = self.hosts.write().map_err(|_| StorageError::LockPoisoned)?;
         let mut inner = self.inner.lock().map_err(|_| StorageError::LockPoisoned)?;
-        sync_identities(&inner.conn, &host_map.values().cloned().collect::<Vec<_>>())?;
+        let mut policy = self
+            .history_policy
+            .write()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        let tx = inner.conn.transaction()?;
+        sync_identities_in_transaction(&tx, &host_map.values().cloned().collect::<Vec<_>>())?;
+        if let Some(config) = &policies {
+            jobs::register_jobs(&tx, &config.maintenance)?;
+        }
+        tx.commit()?;
+        if let Some(config) = policies {
+            *policy = config.history.clone();
+            inner.history_config = config.history;
+            inner.maintenance_config = config.maintenance;
+            inner.history_retention = config.history_retention;
+            inner.usage_sample_retention = Some(config.usage_retention);
+        }
         inner.generation += 1;
         inner.usage.retain(|id, _| {
             current
@@ -388,6 +475,24 @@ impl IcmpRepository for SqliteStorage {
         self.with_inner(move |inner| {
             let txn = inner.conn.transaction()?;
             upsert_latest_state(&txn, &host_id, &state)?;
+            if let Some(at) = state.last_checked_at {
+                history::record(
+                    &txn,
+                    &host_id,
+                    "icmp",
+                    "",
+                    at.timestamp_millis(),
+                    crate::domain::history::HistoryObservation {
+                        state: state.status.as_str().into(),
+                        success: state.last_error.is_none(),
+                        latency_ms: state.latency.map(crate::domain::duration_ms),
+                        console_users: None,
+                        remote_users: None,
+                        error: state.last_error.clone(),
+                    },
+                    Utc::now().timestamp_millis(),
+                )?;
+            }
             if let Some(event) = &transition {
                 insert_transition(&txn, event)?;
             }
@@ -438,6 +543,27 @@ impl UsageRepository for SqliteStorage {
             update_coverage(&txn, &host, &snapshot)?;
             upsert_latest_usage(&txn, &host_id, &snapshot)?;
             insert_usage_sample(&txn, &host_id, &snapshot)?;
+            history::record(
+                &txn,
+                &host_id,
+                "usage",
+                "",
+                snapshot.collected_at.timestamp_millis(),
+                crate::domain::history::HistoryObservation {
+                    state: if snapshot.status == UsageCollectionStatus::Ok {
+                        "up"
+                    } else {
+                        "unknown"
+                    }
+                    .into(),
+                    success: snapshot.status == UsageCollectionStatus::Ok,
+                    latency_ms: None,
+                    console_users: snapshot.console_users,
+                    remote_users: snapshot.remote_users,
+                    error: snapshot.error.clone(),
+                },
+                Utc::now().timestamp_millis(),
+            )?;
             if should_insert_history {
                 insert_usage_history(&txn, &host_id, &snapshot)?;
             }
@@ -539,3 +665,25 @@ fn apply_reader_pragmas(conn: &Connection) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests;
+
+fn database_lock(path: &Path) -> Result<std::fs::File, StorageError> {
+    // A companion lock survives VACUUM's database-file replacement.
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut lock_path = canonical.as_os_str().to_os_string();
+    lock_path.push(".snm-lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| {
+            StorageError::InvalidData(format!("cannot open database ownership lock: {e}"))
+        })?;
+    file.try_lock().map_err(|e| {
+        StorageError::InvalidData(format!(
+            "database is already owned by another process, or cannot be locked: {e}"
+        ))
+    })?;
+    Ok(file)
+}

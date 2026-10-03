@@ -3,10 +3,10 @@ use clap::Parser;
 use simple_network_monitor::{
     AppConfig,
     api::{self, ApiState},
-    backends::ping::{PingBackend, build_backend},
+    app::telemetry::RuntimeMetrics,
     config::ModuleConfigs,
     domain::ApiToken,
-    modules::{self, ModuleRuntimeContext},
+    modules::{self, ModuleRuntimeContext, PreparedMonitor},
     storage::{HostRepository, IcmpRepository, SqliteStorage, UsageRepository},
 };
 use std::{
@@ -42,6 +42,7 @@ async fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    let prepared = prepare_monitor_config(config.clone()).await?;
     let storage = Arc::new(
         SqliteStorage::open(&config.database_path, config.hosts.clone()).map_err(io_other)?,
     );
@@ -56,7 +57,9 @@ async fn main() -> std::io::Result<()> {
     let usage_repository: Arc<dyn UsageRepository> = storage.clone();
     let api_token = Arc::new(RwLock::new(config.api_token.clone()));
     let module_config = Arc::new(RwLock::new(config.modules.clone()));
+    let metrics = Arc::new(RuntimeMetrics::default());
     let api_state = ApiState {
+        metrics: metrics.clone(),
         hosts: Arc::clone(&host_repository),
         icmp: Arc::clone(&icmp_repository),
         usage: Arc::clone(&usage_repository),
@@ -76,9 +79,10 @@ async fn main() -> std::io::Result<()> {
 
     let monitor_manager = tokio::spawn(run_monitor_manager(
         cli.config,
-        config.clone(),
+        prepared,
         MonitorManagerContext {
             storage: Arc::clone(&storage),
+            metrics,
             api_token,
             module_config,
         },
@@ -108,6 +112,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 struct MonitorManagerContext {
+    metrics: Arc<RuntimeMetrics>,
     storage: Arc<SqliteStorage>,
     api_token: Arc<RwLock<Option<ApiToken>>>,
     module_config: Arc<RwLock<ModuleConfigs>>,
@@ -115,10 +120,9 @@ struct MonitorManagerContext {
 
 async fn run_monitor_manager(
     config_path: PathBuf,
-    config: AppConfig,
+    prepared: PreparedMonitorConfig,
     context: MonitorManagerContext,
 ) -> std::io::Result<()> {
-    let prepared = prepare_monitor_config(config).await?;
     manage_monitors(config_path, prepared, context, hup_signal()?).await
 }
 
@@ -133,9 +137,9 @@ async fn manage_monitors(
     let mut config = prepared.config;
     let mut handles = spawn_monitor_generation(
         generation,
-        &config,
-        prepared.backend,
+        prepared.monitors,
         &context.storage,
+        context.metrics.clone(),
         exit_tx.clone(),
     )?;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -193,9 +197,9 @@ async fn manage_monitors(
                         generation += 1;
                         handles = spawn_monitor_generation(
                             generation,
-                            &next_config,
-                            prepared.backend,
+                            prepared.monitors,
                             &context.storage,
+                            context.metrics.clone(),
                             exit_tx.clone(),
                         )?;
 
@@ -236,6 +240,12 @@ impl MonitorHandles {
     }
 }
 
+impl Drop for MonitorHandles {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 struct MonitorExit {
     generation: u64,
     kind: &'static str,
@@ -244,7 +254,7 @@ struct MonitorExit {
 
 struct PreparedMonitorConfig {
     config: AppConfig,
-    backend: Option<Arc<dyn PingBackend>>,
+    monitors: Vec<Box<dyn PreparedMonitor>>,
 }
 
 async fn prepare_monitor_config_from_path(
@@ -255,20 +265,13 @@ async fn prepare_monitor_config_from_path(
 }
 
 async fn prepare_monitor_config(config: AppConfig) -> std::io::Result<PreparedMonitorConfig> {
-    let backend = if icmp_monitor_needed(&config) {
-        Some(Arc::from(
-            build_backend(config.modules.icmp.backend)
-                .await
-                .map_err(io_other)?,
-        ))
-    } else {
-        None
-    };
-    Ok(PreparedMonitorConfig { config, backend })
-}
-
-fn icmp_monitor_needed(config: &AppConfig) -> bool {
-    config.modules.icmp.enabled && config.hosts.iter().any(|host| host.modules.icmp.enabled)
+    let mut monitors = Vec::new();
+    for module in modules::registry() {
+        if let Some(prepared) = module.prepare(&config).await? {
+            monitors.push(prepared);
+        }
+    }
+    Ok(PreparedMonitorConfig { config, monitors })
 }
 
 #[cfg(test)]
@@ -311,23 +314,21 @@ fn apply_reloaded_config(
 
 fn spawn_monitor_generation(
     generation: u64,
-    config: &AppConfig,
-    backend: Option<Arc<dyn PingBackend>>,
+    monitors: Vec<Box<dyn PreparedMonitor>>,
     storage: &SqliteStorage,
+    metrics: Arc<RuntimeMetrics>,
     exit_tx: mpsc::UnboundedSender<MonitorExit>,
 ) -> std::io::Result<MonitorHandles> {
     let repository = Arc::new(storage.monitor_generation().map_err(io_other)?);
     let mut handles = Vec::new();
-    for module in modules::registry() {
-        let Some(spawned) = module.spawn_monitor(ModuleRuntimeContext {
-            config,
-            ping_backend: backend.clone(),
+    for monitor in monitors {
+        let spawned = monitor.spawn(ModuleRuntimeContext {
+            metrics: metrics.clone(),
             host_repository: repository.clone(),
             icmp_repository: repository.clone(),
             usage_repository: repository.clone(),
-        }) else {
-            continue;
-        };
+            tcp_repository: repository.clone(),
+        });
         let abort = spawned.handle.abort_handle();
         watch_monitor_exit(spawned.kind, generation, spawned.handle, exit_tx.clone());
         handles.push(abort);
@@ -397,7 +398,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use simple_network_monitor::{
-        backends::ping::PingCheckRequest,
+        backends::ping::{PingBackend, PingCheckRequest},
         domain::{CheckFailure, HostFilter, HostStatus, PingOutcome, UsageFilter},
     };
     use std::{collections::HashMap, io::Write, time::Duration};
@@ -590,11 +591,15 @@ enabled = false
         let mut manager = tokio::spawn(manage_monitors(
             next.path().to_path_buf(),
             PreparedMonitorConfig {
+                monitors: vec![modules::icmp::IcmpModule::prepare_with_backend(
+                    &initial,
+                    Arc::new(ControlledPing { requests: probe_tx }),
+                )],
                 config: initial,
-                backend: Some(Arc::new(ControlledPing { requests: probe_tx })),
             },
             MonitorManagerContext {
                 storage: storage.clone(),
+                metrics: Arc::new(RuntimeMetrics::default()),
                 api_token: api_token.clone(),
                 module_config: module_config.clone(),
             },
@@ -674,6 +679,6 @@ enabled = true
         .await
         .unwrap();
 
-        assert!(prepared.backend.is_none());
+        assert_eq!(prepared.monitors.len(), 1, "only usage should be prepared");
     }
 }

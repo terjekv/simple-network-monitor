@@ -41,6 +41,7 @@ mod tests {
     fn state(token: Option<&str>) -> ApiState {
         let storage = Arc::new(crate::storage::SqliteStorage::in_memory(vec![]).unwrap());
         ApiState {
+            metrics: Arc::new(crate::app::telemetry::RuntimeMetrics::default()),
             hosts: storage.clone(),
             icmp: storage.clone(),
             usage: storage,

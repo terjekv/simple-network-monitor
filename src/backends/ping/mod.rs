@@ -5,15 +5,15 @@ use crate::{
 use async_trait::async_trait;
 use std::{
     collections::HashSet,
-    net::{IpAddr, ToSocketAddrs},
+    net::IpAddr,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
         atomic::{AtomicU16, Ordering},
     },
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{process::Command, sync::Semaphore, time};
+use tokio::{process::Command, time};
 
 #[derive(Clone, Debug)]
 pub struct PingCheckRequest {
@@ -261,32 +261,8 @@ fn current_platform() -> PingPlatform {
     }
 }
 
-// OS resolver calls can outlive a cancelled future. Keep admission inside the
-// blocking task so repeated deadlines cannot accumulate resolver work.
-static DNS_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
-
 async fn resolve_ip(address: &str) -> Result<IpAddr, CheckFailure> {
-    if let Ok(ip) = address.parse::<IpAddr>() {
-        return Ok(ip);
-    }
-    let permit = DNS_ADMISSION
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| CheckFailure {
-            message: "DNS resolver is busy".into(),
-        })?;
-    let hostname = address.to_owned();
-    let addrs = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        (hostname.as_str(), 0).to_socket_addrs()
-    })
-    .await
-    .map_err(|err| CheckFailure {
-        message: format!("DNS task failed: {err}"),
-    })?
-    .map_err(|err| CheckFailure {
-        message: format!("failed to resolve address: {err}"),
-    })?;
+    let addrs = super::dns::resolve(address, 0).await?;
     // Prefer IPv4 when both families are returned — matches the default behaviour
     // of most ping(8) implementations.
     let mut v4 = None;
@@ -409,7 +385,11 @@ mod tests {
     }
     #[tokio::test]
     async fn saturated_resolver_rejects_without_starting_more_dns_work() {
-        let _all = DNS_ADMISSION.clone().acquire_many_owned(32).await.unwrap();
+        let _all = super::super::dns::DNS_ADMISSION
+            .clone()
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
         assert_eq!(
             resolve_ip("router.example").await.unwrap_err().message,
             "DNS resolver is busy"

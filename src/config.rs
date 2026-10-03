@@ -2,6 +2,7 @@ use crate::{
     domain::{ApiToken, Host},
     modules::{
         icmp::{IcmpHostConfig, IcmpModuleConfig},
+        tcp::{TcpHostConfig, TcpModuleConfig},
         usage::{UsageHostConfig, UsageModuleConfig},
     },
 };
@@ -47,6 +48,7 @@ pub struct AppConfig {
 pub struct ModuleConfigs {
     pub icmp: IcmpModuleConfig,
     pub usage: UsageModuleConfig,
+    pub tcp: TcpModuleConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, serde::Serialize)]
@@ -113,6 +115,7 @@ struct UsageGroupConfig {
 struct ParsedHostModules {
     icmp: IcmpHostConfig,
     usage: UsageHostConfig,
+    tcp: TcpHostConfig,
 }
 
 struct ParsedGroupModules {
@@ -323,6 +326,15 @@ impl RawConfig {
                 )));
             }
             validate_host_module_durations(&raw.id, &icmp, &usage)?;
+            let tcp = modules.tcp.resolve_host(parsed_modules.tcp);
+            if tcp.enabled && !modules.tcp.enabled {
+                return Err(ConfigError::Invalid(format!(
+                    "host {:?}: TCP requires modules.tcp.enabled = true",
+                    raw.id
+                )));
+            }
+            tcp.validate()
+                .map_err(|err| ConfigError::Invalid(format!("host {:?}: {err}", raw.id)))?;
 
             hosts.push(Host {
                 name: raw.name.unwrap_or_else(|| raw.id.clone()),
@@ -330,7 +342,7 @@ impl RawConfig {
                 address: raw.address,
                 groups,
                 metadata: raw.metadata,
-                modules: crate::domain::host::HostModuleConfig { icmp, usage },
+                modules: crate::domain::host::HostModuleConfig { icmp, usage, tcp },
             });
         }
 
@@ -353,9 +365,10 @@ fn parse_global_modules(raw: HashMap<String, toml::Value>) -> Result<ModuleConfi
         match id.as_str() {
             "icmp" => modules.icmp = parse_module_scope("modules.icmp", value)?,
             "usage" => modules.usage = parse_module_scope("modules.usage", value)?,
+            "tcp" => modules.tcp = parse_module_scope("modules.tcp", value)?,
             _ => {
                 return Err(ConfigError::Invalid(format!(
-                    "unknown module {id:?}; valid modules: icmp, usage"
+                    "unknown module {id:?}; valid modules: icmp, usage, tcp"
                 )));
             }
         }
@@ -370,9 +383,13 @@ fn parse_host_modules(
     let mut modules = ParsedHostModules {
         icmp: IcmpHostConfig::default(),
         usage: UsageHostConfig::default(),
+        tcp: TcpHostConfig::default(),
     };
     for (id, value) in raw {
         match id.as_str() {
+            "tcp" => {
+                modules.tcp = parse_module_scope(&format!("hosts.{host_id}.modules.tcp"), value)?
+            }
             "icmp" => {
                 modules.icmp = parse_module_scope(&format!("hosts.{host_id}.modules.icmp"), value)?
             }
@@ -382,7 +399,7 @@ fn parse_host_modules(
             }
             _ => {
                 return Err(ConfigError::Invalid(format!(
-                    "host {host_id:?}: unknown module {id:?}; valid modules: icmp, usage"
+                    "host {host_id:?}: unknown module {id:?}; valid modules: icmp, usage, tcp"
                 )));
             }
         }
@@ -426,6 +443,13 @@ where
 }
 
 fn validate_module_config(modules: &ModuleConfigs) -> Result<(), ConfigError> {
+    validate_duration("modules.tcp.interval", modules.tcp.interval)?;
+    validate_duration("modules.tcp.timeout", modules.tcp.timeout)?;
+    if !(1..=4096).contains(&modules.tcp.concurrency) {
+        return Err(ConfigError::Invalid(
+            "modules.tcp.concurrency must be between 1 and 4096".into(),
+        ));
+    }
     if !(1..=4096).contains(&modules.icmp.concurrency) {
         return Err(ConfigError::Invalid(
             "modules.icmp.concurrency must be between 1 and 4096".into(),
@@ -844,3 +868,6 @@ hosts = [
         );
     }
 }
+
+#[cfg(test)]
+mod tcp_tests;

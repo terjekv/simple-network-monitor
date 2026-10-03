@@ -83,3 +83,13 @@ pub trait UsageRepository: Send + Sync + 'static {
 
     async fn usage_report(&self, filter: UsageFilter) -> Result<UsageReport, StorageError>;
 }
+
+#[async_trait]
+pub trait TcpRepository: Send + Sync + 'static {
+    async fn update_tcp(
+        &self,
+        host_id: &str,
+        check_id: &crate::domain::tcp::CheckId,
+        snapshot: crate::domain::tcp::TcpSnapshot,
+    ) -> Result<(), StorageError>;
+}

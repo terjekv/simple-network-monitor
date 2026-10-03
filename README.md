@@ -1,6 +1,8 @@
 # Simple Network Monitor
 
-Rust daemon that monitors configured hosts with ICMP and exposes latest status plus transition history over JSON.
+Rust daemon that monitors ICMP reachability, SSH user counts, and named TCP ports.
+Exposes current observations over JSON and Prometheus metrics, with ICMP and
+usage history in SQLite.
 
 [![CI](https://github.com/terjekv/simple-network-monitor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/terjekv/simple-network-monitor/actions/workflows/ci.yml)
 
@@ -177,7 +179,7 @@ logged and ignored. If the inventory cannot be persisted (for example, because
 SQLite is busy), the reload is logged and rejected while the current configuration
 and monitors remain active. Send `SIGHUP` again to retry after resolving the error.
 Host lists, groups, metadata, polling settings, backend,
-usage settings, and API token reload. `bind` and `database_path` changes are
+usage settings, named TCP checks, and API token reload. `bind` and `database_path` changes are
 logged but still require a process restart. `api_workers` also requires a
 restart because Actix worker threads are created when the HTTP server starts.
 
@@ -189,6 +191,7 @@ dependency ([RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258
 For example:
 
 ```sh
+curl http://127.0.0.1:3000/metrics
 curl http://127.0.0.1:3000/healthz
 curl http://127.0.0.1:3000/v1/namespaces
 curl http://127.0.0.1:3000/v1/modules
@@ -249,6 +252,10 @@ changing `api_workers` requires a restart.
 
 Host filters are strict. Dotted filters must use a known namespace and key, except `metadata.<field>` which accepts any metadata field name. Duplicate query keys are rejected with `400`. Metadata filters use exact scalar equality for strings, booleans, and numbers (byte-exact, case-sensitive); arrays and objects are not query-matchable. Use `GET /v1/namespaces` to discover supported filter namespaces and keys, and `GET /v1/modules` for module metadata and config option docs.
 
+The module catalog's `enabled` field reports each module's current global gate,
+including TCP, and reflects successful config reloads. It does not indicate
+whether any hosts have checks configured for that module.
+
 Config files are validated strictly: unknown keys in `[table]` blocks or `[[hosts]]` entries fail at startup with the offending key, so typos like `bakend = "raw"` surface immediately rather than silently using a default.
 
 OpenAPI is generated from Rust endpoint/type annotations with `utoipa`, available at `GET /openapi.json`, and browsable at `/swagger-ui/`.
@@ -303,8 +310,9 @@ allowance reset coverage. Retention bounds how far back an affirmative result
 can extend. On the first upgrade from schema version 1, current observations
 are cleared because the old schema did not record host addresses; histories
 are retained. Later address changes, including across restart, reset current
-state and coverage. Back up the SQLite database before upgrading: schema v2
-cannot be opened by a v1 binary.
+state and coverage. Back up the SQLite database before upgrading: schema v3
+cannot be opened by v1/v2 binaries. The v2-to-v3 migration adds TCP current
+observations and preserves existing ICMP and usage data.
 
 Configuration durations and inactivity windows must be between 1 ms and 10
 years. API worker counts are 1..256 and probe concurrency is 1..4096. Four
@@ -355,3 +363,140 @@ Configure the resulting jobs as required checks in repository settings.
 
 Tagged release reruns compare existing assets byte-for-byte and fail on a
 mismatch. Only the separate `main-latest` publication can replace assets.
+
+## Named TCP checks
+
+Enable `[modules.tcp] enabled = true` and configure checks per host:
+
+```toml
+[hosts.modules.tcp]
+checks = [{ id = "ssh", port = 22 }, { id = "web", port = 443 }]
+# Optional host overrides:
+interval = "30s"
+timeout = "3s"
+```
+
+TCP is disabled by default. The global gate, host opt-out, interval, and timeout
+follow the existing module conventions. Ports must be 1..65535; IDs must be
+unique within a host's TCP module and contain 1..128 ASCII letters, digits,
+dash, underscore, or dot (excluding `.` and `..`). At most 64 checks are allowed
+per host. The module defaults to 64 concurrent checks (valid range 1..4096).
+The deadline covers DNS and sequential attempts at resolved addresses. Resolution
+shares the bounded resolver with ICMP and retains at most 64 addresses. A TCP
+success means that a connection was established; it does not test TLS or an
+application protocol.
+
+Host JSON responses include a `tcp` array with `id`, `port`, `enabled`, `stale`,
+and `observation`. An observation contains `observed_at`, `success`,
+`duration_seconds`, and `error`; it is null until a result exists. `/readyz`
+includes enabled TCP checks, and a fresh failed connection counts as a current
+observation. Current TCP results persist across restart. Changing a host address
+or check port, removing a check, or disabling TCP clears its current result.
+TCP currently stores latest observations; historical charts come from the
+metrics backend. Existing ICMP and usage response fields retain their meaning.
+
+## Prometheus and OpenTelemetry
+
+`GET /metrics` serves Prometheus text format on the existing HTTP listener,
+with the same bearer-token authentication and reload behavior as the JSON API.
+It reads persisted state without performing network checks. A failed storage
+read fails the scrape instead of returning an empty successful response.
+Keep the default loopback binding; use the documented authenticated listener
+and TLS reverse proxy when scraping remotely.
+
+A local Prometheus scrape configuration (with `api_token` configured on the
+monitor) can use a separately provisioned token file:
+
+```yaml
+scrape_configs:
+  - job_name: simple-network-monitor
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['127.0.0.1:3000']
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/simple-network-monitor.token
+```
+
+The token file contains the configured token, without the `Bearer` prefix.
+Omit `authorization` only for a loopback deployment without a configured token.
+In containers, loopback refers to that container's network namespace; use a
+reachable authenticated endpoint for separate containers.
+
+Metric families:
+
+| Metric | Type and meaning |
+| --- | --- |
+| `snm_check_enabled` | Gauge: configured check is enabled |
+| `snm_check_fresh` | Gauge: enabled check has a current observation |
+| `snm_check_last_observed_timestamp_seconds` | Gauge: observation time, including failed attempts |
+| `snm_icmp_status{state="unknown\|up\|down"}` | Gauges: exactly one state is 1 per enabled host |
+| `snm_icmp_round_trip_seconds` | Gauge: latest RTT, present for a fresh successful attempt |
+| `snm_usage_collection_success` | Gauge: latest usage attempt succeeded |
+| `snm_usage_users{session="console\|remote"}` | Gauge: user count, present only for fresh successful collection |
+| `snm_tcp_connect_success` | Gauge: latest TCP attempt succeeded |
+| `snm_tcp_connect_duration_seconds` | Gauge: fresh successful TCP attempt duration, including DNS |
+| `snm_check_runs_total{kind,result}` | Counter: completed executions, with success/failure result |
+| `snm_check_duration_seconds{kind}` | Histogram: execution time, excluding queueing and persistence |
+| `snm_storage_retries_total{kind}` | Counter: persistence retries |
+
+The common check gauges use `host_id` and `check_id` labels. Check IDs are `icmp`,
+`usage`, or `tcp.<configured-id>`. TCP-specific metrics use the same two labels;
+ICMP/usage-specific metrics use `host_id` plus the documented state/session label.
+Metadata, addresses, usernames, and error text are excluded from labels.
+State gauges show last known results, so alerting must also check freshness.
+Freshness uses the same two intervals plus timeout allowance as the JSON API;
+missing and future-dated observations are not fresh. Observation timestamps are
+metric values, not explicit sample timestamps.
+
+Disabled checks retain only their enabled/fresh gauges (both zero); removed hosts
+and checks disappear on subsequent scrapes. Unknown observations omit their
+observation timestamp and result measurements. ICMP retains its explicit unknown
+state. Failed usage collection never produces a fabricated zero-user count.
+The counters and histograms begin with the first completed execution, survive
+configuration reloads, and reset at process restart. Scrapes and persistence
+retries never count as additional check executions.
+
+Example alert rules:
+
+```yaml
+groups:
+  - name: simple-network-monitor
+    rules:
+      - alert: NetworkMonitorUnavailable
+        expr: up{job="simple-network-monitor"} == 0
+        for: 2m
+      - alert: NetworkCheckStale
+        expr: (snm_check_enabled == 1) and (snm_check_fresh == 0)
+        for: 2m
+      - alert: NetworkHostDown
+        expr: >-
+          (snm_icmp_status{state="down"} == 1)
+          and on(job, instance, host_id)
+          (snm_check_fresh{check_id="icmp"} == 1)
+        for: 1m
+      - alert: NetworkTcpCheckFailed
+        expr: (snm_tcp_connect_success == 0) and (snm_check_fresh == 1)
+        for: 1m
+```
+
+Prometheus's `up` metric describes scrape availability; it does not describe a
+monitored host. ICMP state follows configured failure/success thresholds, while
+TCP reports each connection result directly. A freshness alert detects a stalled
+collector even while the HTTP server remains reachable.
+
+An OpenTelemetry Collector can scrape this endpoint with its
+[Prometheus receiver](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/prometheusreceiver)
+and forward the metrics through its configured OTLP exporter. Put the same
+`scrape_configs` under `receivers.prometheus.config` and enable that receiver in
+the Collector's metrics pipeline. Native OTLP export is not required by the daemon.
+
+## Extending checks
+
+Checks use a typed async `domain::check::Check` boundary. Existing `PingBackend`
+and `UsageCollector` traits remain supported through adapters; TCP implements
+`Check` directly. Module preparation constructs dependencies before a startup or
+reload is committed, and the shared runner handles timing, concurrency,
+persistence retries, execution metrics, and task supervision. See
+[Writing Monitor Modules](docs/modules.md) for the extension workflow and
+invariants. Extensions are compiled into the binary.

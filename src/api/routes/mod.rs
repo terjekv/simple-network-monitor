@@ -100,9 +100,16 @@ pub(crate) async fn readyz(
     let mut current_checks = 0;
     for record in records {
         let dto = HostResponse::from(record);
-        enabled_checks += usize::from(dto.icmp_enabled) + usize::from(dto.usage_enabled);
+        enabled_checks += usize::from(dto.icmp_enabled)
+            + usize::from(dto.usage_enabled)
+            + dto.tcp.iter().filter(|check| check.enabled).count();
         current_checks += usize::from(dto.icmp_enabled && !dto.icmp_stale)
-            + usize::from(dto.usage_enabled && !dto.usage_stale);
+            + usize::from(dto.usage_enabled && !dto.usage_stale)
+            + dto
+                .tcp
+                .iter()
+                .filter(|check| check.enabled && !check.stale)
+                .count();
     }
     let ready = enabled_checks == current_checks;
     let mut response = if ready {
@@ -252,6 +259,7 @@ pub(crate) async fn module_catalog(
             let enabled = match metadata.id {
                 "icmp" => module_config.icmp.enabled,
                 "usage" => module_config.usage.enabled,
+                "tcp" => module_config.tcp.enabled,
                 _ => false,
             };
             let filters = supported_module_filter_specs(metadata.id, module.filter_specs());

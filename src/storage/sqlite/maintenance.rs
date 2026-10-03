@@ -83,6 +83,7 @@ pub(super) fn sync_identities(conn: &Connection, hosts: &[Host]) -> Result<(), S
             [],
         )?;
     }
+    super::tcp::sync_checks(&txn, hosts)?;
     txn.commit()?;
     Ok(())
 }

@@ -31,5 +31,5 @@ subtle = "2.6.1"
 r2d2 = "0.8.10"
 
 [dev-dependencies]
-rstest = "0.27.0"
+rstest = "0.28.0"
 tempfile = "3.27.0"
